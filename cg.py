@@ -9,12 +9,16 @@ Usage:
 """
 import bisect
 import csv
+import os
 import struct
 import sys
 from collections import defaultdict
 
 EXE = "/mnt/c/Games/RC Cars/RCCars.exe"
-CSVP = "/mnt/c/tools/rccars_re/RCCars.exe.functions.csv"
+# The Ghidra exports sit next to this script -- they are gitignored, so this
+# resolves against the script and not the caller's working directory.
+HERE = os.path.dirname(os.path.abspath(__file__))
+CSVP = os.path.join(HERE, "RCCars.exe.functions.csv")
 
 
 def sections(d):

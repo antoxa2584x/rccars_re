@@ -3,6 +3,7 @@
 attributed to the enclosing function."""
 import bisect
 import csv
+import os
 import struct
 import sys
 
@@ -22,9 +23,14 @@ def pe_sections(d):
     return out
 
 
+# The Ghidra exports sit next to this script -- they are gitignored, so this
+# resolves against the script and not the caller's working directory.
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
 def main():
     exe = "/mnt/c/Games/RC Cars/RCCars.exe"
-    csvp = "/mnt/c/tools/rccars_re/RCCars.exe.functions.csv"
+    csvp = os.path.join(HERE, "RCCars.exe.functions.csv")
     targets = {int(a, 16) for a in sys.argv[1:]}
 
     d = open(exe, "rb").read()

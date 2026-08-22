@@ -8,8 +8,13 @@ accesses into per-car tuning arrays.
 """
 import bisect
 import csv
+import os
 import struct
 import sys
+
+# The Ghidra exports sit next to this script -- they are gitignored, so this
+# resolves against the script and not the caller's working directory.
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def pe_sections(d):
@@ -45,7 +50,7 @@ def main():
     lo = int(sys.argv[1], 16)
     hi = int(sys.argv[2], 16)
     exe = sys.argv[3] if len(sys.argv) > 3 else "/mnt/c/Games/RC Cars/RCCars.exe"
-    csvp = sys.argv[4] if len(sys.argv) > 4 else "/mnt/c/tools/rccars_re/RCCars.exe.functions.csv"
+    csvp = sys.argv[4] if len(sys.argv) > 4 else os.path.join(HERE, "RCCars.exe.functions.csv")
 
     d = open(exe, "rb").read()
     secs = pe_sections(d)

@@ -11,11 +11,16 @@ Loaders follow a fixed idiom:
 so pairing the most recent key push with each float store recovers the layout.
 """
 import re
+import os
 import struct
 import subprocess
 import sys
 
 EXE = "/mnt/c/Games/RC Cars/RCCars.exe"
+# The Ghidra exports sit next to this script -- they are gitignored, so this
+# resolves against the script and not the caller's working directory.
+HERE = os.path.dirname(os.path.abspath(__file__))
+CSVP = os.path.join(HERE, "RCCars.exe.functions.csv")
 
 
 def pe(d):
@@ -60,7 +65,7 @@ def main():
         start = int(spec, 16)
         # size from functions.csv
         size = None
-        for line in open("/mnt/c/tools/rccars_re/RCCars.exe.functions.csv"):
+        for line in open(CSVP):
             f = line.split(",")
             if len(f) > 2 and f[0].lower() == "%08x" % start:
                 size = int(f[2])
