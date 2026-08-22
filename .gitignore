@@ -1,0 +1,59 @@
+# Python bytecode caches
+__pycache__/
+*.pyc
+
+# Host-side test harnesses, built ad hoc with gcc (no extension, so listed by
+# name). Their sources -- audio_test.c, proptest.c, wetcheck.c, ... -- are
+# tracked, and ../rccars_vita/BUILD.md documents the gcc lines that build them.
+aitest
+allstarts
+antheight
+atstart
+audio_test
+carparts_test
+ceiling
+chartest
+chrfloat
+colprof
+cpground
+curb
+flipped
+hudshot
+inv
+menu_test
+meshalign
+placechk
+proptest
+rockroll
+ui_test
+vis_test
+wading
+wetcheck
+
+# Ghidra headless output. Regenerated from a personal copy of RC Cars by the
+# scripts in this directory (DumpNamedFunctions.java, DumpAssetLoaders.java,
+# ...). Decompiled game code -- must not be redistributed. The .java scripts
+# that produce it are tracked.
+*.named.c
+*.named_index.txt
+*.candidates.c
+*.functions.csv
+*.strings_xref.txt
+*.gpr
+*.rep/
+
+# Game-derived data dumped by the unpack/analysis scripts. Same rule: generated
+# from your own copy of the game, not redistributable.
+keystream.bin
+splines_csv/
+*.sb
+*.crs
+*.pack
+*.vsc
+*.col
+*.sbk
+*.png
+*.obj
+
+# Logs
+*.log
