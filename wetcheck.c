@@ -741,7 +741,18 @@ int main(void)
                 if (v5) tail += (long)nt;                  /* light    */
                 if (v4) tail += (long)nt;                  /* eng_surf */
                 if (v3) tail += (long)nx * nz * 4;         /* water    */
-                tail += (long)nt + (long)nt / 2;           /* into `surf` */
+                /* HALF of `surf`, not all of it and half again. The three lines
+                   above already carry every array BEHIND surf, so `nt + nt/2`
+                   removed surf entirely and then cut 17,838 bytes into the GRID
+                   REFERENCE ARRAY in front of it -- a different state from the
+                   one this fixture is named for, and one col_load used to accept,
+                   leaving 4,459 references uninitialised and then indexing
+                   tris[] with them. Which is the third time this arithmetic has
+                   been wrong in the same place: twice by counting one array too
+                   FEW when the format grew, and once by counting one too MANY
+                   while fixing that. The cut is into surf's own bytes now, and
+                   the check below covers the idx case on purpose. */
+                tail += (long)nt / 2;                      /* into `surf` */
                 printf("  %.4s, %u tris, %u x %u cells -> cutting %ld bytes\n",
                        (const char *)buf, nt, nx, nz, tail);
                 o = fopen("/tmp/wetcheck_trunc.col", "wb");
@@ -768,6 +779,26 @@ int main(void)
                     col_free(&col);
                 } else {
                     ck(0, "a truncated grid still loads its triangles");
+                }
+
+                /* AND THE ARRAYS IT CANNOT RUN WITHOUT ARE A REFUSAL, NOT A
+                   DEGRADATION. Everything above is behind `surf` and is optional:
+                   a missing material, water, class or lightmap array is a duller
+                   car or a drier track. The triangles, the cell offsets and the
+                   grid references are not optional -- the queries index tris[]
+                   BY idx[], so a short idx array is an out-of-bounds read in the
+                   hottest loop in the port rather than a lost feature. Cut into
+                   idx and the whole grid has to be rejected. */
+                {
+                    long cut = tail + (long)nt;   /* the rest of surf, into idx */
+                    o = fopen("/tmp/wetcheck_noidx.col", "wb");
+                    if (o) {
+                        fwrite(buf, 1, (size_t)(sz - cut), o);
+                        fclose(o);
+                    }
+                    ck(col_load("/tmp/wetcheck_noidx.col", &col) == 0,
+                       "but a grid cut into its REFERENCES is refused outright");
+                    col_free(&col);
                 }
             }
             free(buf);

@@ -1032,6 +1032,47 @@ static void part6(void)
         } else {
             ck(0, "could not write %s", path);
         }
+
+        /* AND THE RECORD ARRAY ITSELF, which is a different question from the
+         * one above: that file keeps all five records and cuts the SAMPLES, so
+         * it exercises the per-slot sample-block bound and says nothing about
+         * the array the loop walks to REACH it. A header claiming five
+         * opponents over one record's worth of bytes read past the blob at
+         * ai.c's `memcpy(u16, r + 48, ...)` -- an ASan heap-buffer-overflow,
+         * 40 bytes past a 120-byte allocation.
+         *
+         * Simply cutting inside the record array is NOT an oracle: the garbage
+         * records that follow are then rejected by the per-slot sample bound as
+         * often as not, so the check passes on the broken code in a plain build
+         * and only fails under ASan -- which is the same "build layout decides
+         * the verdict" hazard this file already carries for part 4. So slot 0 is
+         * made GENUINELY VALID over a compact copy of its own first two real
+         * samples, and the header still claims five. The old bound accepts the
+         * file (one record's worth of bytes is all it asked for), loads slot 0
+         * and returns 1; the record-array bound refuses it and returns 0. That
+         * is a deterministic kill with no dependence on what is past the end. */
+        f = fopen(path, "wb");
+        if (f) {
+            unsigned char small[12 + AI_RECORD_BYTES + 2 * AI_SAMPLE_BYTES];
+            unsigned int n_s = 2, cyc = 0, off = 12 + AI_RECORD_BYTES;
+            unsigned int src_off;
+            memcpy(small, buf, 12);                       /* AIP1, count 5 */
+            memcpy(small + 12, buf + 12, AI_RECORD_BYTES); /* record 0 verbatim */
+            memcpy(&src_off, buf + 12 + 64 + 8, 4);        /* its real samples */
+            memcpy(small + 12 + 64 + 0, &n_s, 4);
+            memcpy(small + 12 + 64 + 4, &cyc, 4);
+            memcpy(small + 12 + 64 + 8, &off, 4);
+            memcpy(small + off, buf + src_off, 2 * AI_SAMPLE_BYTES);
+            fwrite(small, 1, sizeof(small), f);
+            fclose(f);
+            memset(&ai, 0, sizeof(ai));
+            ck(ai_init(&ai, 0, dir, NULL, 1, 0) == 0,
+               "an .aip whose opponent count outruns its records is refused"
+               " (and slot 0 alone is valid, so only the count can refuse it)");
+            ai_free(&ai);
+        } else {
+            ck(0, "could not write %s", path);
+        }
     }
     free(buf);
 }
