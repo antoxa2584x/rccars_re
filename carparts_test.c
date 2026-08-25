@@ -39,6 +39,14 @@ void glGetFloatv(GLenum pname, GLfloat *out)
 }
 void glVertexPointer(GLint a, GLenum b, GLsizei c, const void *d) { (void)a;(void)b;(void)c;(void)d; }
 void glTexCoordPointer(GLint a, GLenum b, GLsizei c, const void *d) { (void)a;(void)b;(void)c;(void)d; }
+/* The car's per-vertex light -- scene.c binds it as a colour array and uploads
+   it per frame (carlight.h). No-op here: nothing in this harness asserts on a
+   draw. */
+void glColorPointer(GLint size, GLenum type, GLsizei stride, const void *p)
+{ (void)size; (void)type; (void)stride; (void)p; }
+void glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size,
+                     const void *data)
+{ (void)target; (void)offset; (void)size; (void)data; }
 void glDrawElements(GLenum a, GLsizei b, GLenum c, const void *d) { (void)a;(void)b;(void)c;(void)d; }
 /* scene.c's vertex buffers. Real ids, so scene_load takes the SAME branch here
    as on hardware and the batches end up buffered rather than quietly falling

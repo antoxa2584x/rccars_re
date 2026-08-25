@@ -45,6 +45,26 @@ int main(void)
         memset(&ai,0,sizeof ai);
         if (!ai_init(&ai,t,"assets",col_rb_world(&col),1,0)) {
             scene_release(&sc); col_free(&col); continue; }
+        /* AS THE APP DOES, and in the app's order: fit the checkpoint stations
+           off the recordings, install them, and only then restart -- cp_restart
+           reads road_len to place the grid, and without any of it the measure
+           runs on the spine's arc lengths and the pre-start answer is the
+           degenerate 0. The player here is driven along the first opponent's
+           recording, so its race starts where that recording does. */
+        {
+            float mk[CP_MAX][3], frac[CP_MAX], ll = 0.f;
+            int m = cps.n < CP_MAX ? cps.n : CP_MAX, j;
+            for (j = 0; j < m; j++) {
+                mk[j][0] = cps.cp[j].p[0][0];
+                mk[j][1] = cps.cp[j].p[0][1];
+                mk[j][2] = cps.cp[j].p[0][2];
+            }
+            if (ai_cp_fractions(&ai, (const float (*)[3])mk, m, frac, &ll))
+                cp_set_stations(&cps, frac, m, ll);
+        }
+        cp_restart(&cps, ai.car[0].rec_x[0], ai.car[0].rec_x[1],
+                   ai.car[0].rec_x[2]);
+        memset(&tr,0,sizeof tr);
         tr.ctx=&cps; tr.spine=sp; tr.lap_progress=lp; tr.spine_len=cps.spine_len;
         for (k=0;k<AI_MAX_OPPONENTS;k++) oprev[k]=-1e9f;
         pc = &ai.car[0];

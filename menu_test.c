@@ -241,6 +241,24 @@ int main(void){
     m.tex_swap_rb=1; draw_fresh(&m);
     ck(drew("Vita3K"),"and the swapped order says it is the one for Vita3K");
 
+    /* ---- the car's own light (carlight.h) -------------------------------- */
+    menu_init(&m,0,0); prev=0;
+    press(&m,SCE_CTRL_START);
+    ck(m.car_light==1,"car lighting defaults ON -- it is what the engine does");
+    m.row=MENU_CARLIGHT;
+    m.req_reload=0;
+    press(&m,SCE_CTRL_RIGHT);
+    ck(m.car_light==0,"RIGHT turns it off");
+    /* NO RELOAD, and that is the point of the row: it is GL state and a
+       per-frame step, so it can be judged by eye without a track load. */
+    ck(m.req_reload==0,"and asks for no reload -- nothing has to be re-uploaded");
+    press(&m,SCE_CTRL_LEFT);
+    ck(m.car_light==1,"LEFT turns it back on -- either direction toggles");
+    m.car_light=1; draw_fresh(&m);
+    ck(drew("138"),"the ON side names the engine's own ambient byte");
+    m.car_light=0; draw_fresh(&m);
+    ck(drew("flat"),"and the OFF side says what it looks like");
+
     /* Every other picker still wraps -- the clamp is deliberate and local, and a
        clamp copied onto the track row would strand the player on track 1. */
     menu_init(&m,0,0); prev=0;

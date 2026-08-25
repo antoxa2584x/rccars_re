@@ -547,6 +547,77 @@ int main(void)
         col_free(&col);
     }
 
+    /* ---- part 8: THE CADENCE prop_step IS CALLED AT ------------------- *
+     *
+     * Every fixture above drives prop_step once per 1/240 substep, which is the
+     * finest the car is ever simulated at and is NOT what the app does. main.c
+     * spends a frame's banked time in whole 1/60 ticks, and it used to run the
+     * whole frame of car physics and only then step the props ONCE, with the
+     * frame's total dt -- so at 30 fps the props were tested against a car that
+     * had already moved 23 cm since they last saw it, and at 20 fps 35 cm.
+     *
+     * A Cola can is two 4.4 cm spheres and a front wheel is 4.9 to 7.2 cm, so
+     * the pair is inside each other over about 20 cm of travel. The arithmetic
+     * is not subtle and neither was the result: the can was driven straight
+     * through, on every approach line tried, at every frame rate below 60 --
+     * the reported "objects go through the player car". Nothing in this file
+     * could see it, because nothing in this file ran at the app's cadence.
+     *
+     * So this part drives the same pass at three step sizes and asks which of
+     * them can still find the can. RBCAR_TICK_DT is the contract: main.c calls
+     * prop_step once per TICK (rbcar_step_frame_cb), never once per frame. */
+    printf("\n-- part 8: the cadence, and what it can still hit --\n");
+    if (load_track_col(&col, 0)) {
+        static const int MULT[3] = { 1, 2, 3 };     /* 60, 30, 20 fps of frame */
+        int touched[3], mi;
+
+        for (mi = 0; mi < 3; mi++) {
+            props_t pr;
+            rb_car car;
+            float gy;
+            int step;
+
+            memset(&pr, 0, sizeof pr);
+            pr.col = &col;
+            pr.enabled = 1;
+            pr.n = 1;
+            memset(&pr.p[0], 0, sizeof pr.p[0]);
+            pr.p[0].model = 1;                      /* Cola */
+            pr.p[0].q[0] = 1.f;
+            pr.p[0].awake = 1;
+            rbcar_init(&car, 0, col_rb_world(&col), TRACKS[0].x, TRACKS[0].y,
+                       TRACKS[0].z, TRACKS[0].yaw);
+            {   /* on a wheel line, six metres up the road -- see part 7 */
+                const float *m = rbcar_matrix(&car);
+                pr.p[0].pos[0] = car.body.x[0] + m[8] * 6.f + m[0] * 0.070f;
+                pr.p[0].pos[2] = car.body.x[2] + m[10] * 6.f + m[2] * 0.070f;
+                if (col_ground_at(&col, pr.p[0].pos[0], pr.p[0].pos[2], 1e9f,
+                                  &gy, NULL, NULL, NULL))
+                    pr.p[0].pos[1] = gy + PROP_MODELS[1].com_y + 0.02f;
+                prop_matrix(&pr.p[0], pr.p[0].m);
+            }
+            touched[mi] = 0;
+            for (step = 0; step < 240 * 6; step++) {
+                rbcar_step(&car, 1.f, 0.f, 0.f, 0, 1.f / 240.f);
+                if ((step % (4 * MULT[mi])) == 4 * MULT[mi] - 1)
+                    prop_step(&pr, &car, MULT[mi] * RBCAR_TICK_DT);
+                if (pr.p[0].touched)
+                    touched[mi]++;
+            }
+        }
+        printf("  contacts found: %d at 1 tick, %d at 2, %d at 3\n",
+               touched[0], touched[1], touched[2]);
+        ck(touched[0] > 0, "one RBCAR_TICK_DT per prop_step finds the can",
+           "%d contact steps", touched[0]);
+        /* THE POINT. If a frame's worth of ticks is ever batched into one
+           prop_step again this line stops being true, and so does the game. */
+        ck(touched[2] == 0,
+           "  and three ticks in one call does NOT -- the can is tunnelled"
+           " through, which is why main.c steps this per TICK",
+           "%d contact steps", touched[2]);
+        col_free(&col);
+    }
+
     printf("\n%d checks, %d failed\n", checks, fails);
     return fails ? 1 : 0;
 }

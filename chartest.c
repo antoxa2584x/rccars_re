@@ -176,6 +176,11 @@ void glTexCoordPointer(GLint size, GLenum type, GLsizei stride, const void *p)
 { (void)size; (void)type; tp = (const float *)p; tstride = stride / 4; }
 void glColorPointer(GLint size, GLenum type, GLsizei stride, const void *p)
 { (void)size; (void)type; (void)stride; (void)p; }
+/* The car's per-vertex light is uploaded through here every frame (carlight.h).
+   No-op: nothing in this harness asserts on a draw. */
+void glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size,
+                     const void *data)
+{ (void)target; (void)offset; (void)size; (void)data; }
 void glBlendFunc(GLenum a, GLenum b) { (void)a; (void)b; }
 void glPolygonOffset(GLfloat f, GLfloat u) { (void)f; (void)u; }
 void glDepthMask(GLboolean b) { (void)b; }
@@ -1055,12 +1060,55 @@ static void part7(void)
                : 1,
            "  and inside its own inhabitVolume", "at %.1f, %.1f", s->x, s->z);
 
-        /* now put the car in the middle of the visibility volume */
-        car[0] = (pl->sight.qx[0] + pl->sight.qx[2]) * 0.5f;
-        car[2] = (pl->sight.qz[0] + pl->sight.qz[2]) * 0.5f;
-        car[1] = (pl->sight.ylo + pl->sight.yhi) * 0.5f;
+        /*
+         * THE VOLUME IS THE GATE, NOT THE TRIGGER, and telling those apart is
+         * the only check here that can. 0x513040 asks whether a car is in the
+         * visibilityVolume at all and 0x513100 asks whether one is within
+         * CHR_GULL_STARTLE (4.0 m) -- so a car parked in the middle of a volume
+         * tens of metres across must NOT put the bird up, and this fixture used
+         * to do exactly that and call the take-off correct.
+         */
+        {
+            /* The corner of its own volume FURTHEST from the bird, pulled 10%
+               back toward the centre so it is unarguably inside: beach_1's
+               visibilityVolume is only about nine metres across, so the centre
+               of it sits 4.5 m out and that is far too near the 4.0 m
+               threshold to be a control. */
+            float cx = 0.0f, cz = 0.0f, best = -1.0f;
+            int k, kb = 0;
+            for (k = 0; k < 4; k++) { cx += pl->sight.qx[k];
+                                      cz += pl->sight.qz[k]; }
+            cx *= 0.25f; cz *= 0.25f;
+            for (k = 0; k < 4; k++) {
+                float dx = pl->sight.qx[k] - s->x, dz = pl->sight.qz[k] - s->z;
+                if (dx * dx + dz * dz > best) { best = dx * dx + dz * dz; kb = k; }
+            }
+            car[0] = pl->sight.qx[kb] + (cx - pl->sight.qx[kb]) * 0.1f;
+            car[2] = pl->sight.qz[kb] + (cz - pl->sight.qz[kb]) * 0.1f;
+            car[1] = (pl->sight.ylo + pl->sight.yhi) * 0.5f;
+        }
         ck(chr_in_volume(&pl->sight, car[0], car[1], car[2]),
            "  the fixture's car really is in the volume", "");
+        {
+            float d = sqrtf((car[0] - s->x) * (car[0] - s->x)
+                            + (car[2] - s->z) * (car[2] - s->z));
+            ck(d > CHR_GULL_STARTLE + 1.0f,
+               "  and further off than CHR_GULL_STARTLE, so it is a control",
+               "%.1f m against %.1f", d, CHR_GULL_STARTLE);
+            step_n(&c, car, 5.0f, 60 * 8, 1.0f / 60.0f);
+            ck(s->state != CHR_ST_FLY && s->state != CHR_ST_ACT,
+               "  in the volume but out of reach it stays down", "state %d",
+               s->state);
+        }
+
+        /* And now within reach of it: a car, a person or a dog inside 4.0 m. */
+        car[0] = s->x + CHR_GULL_STARTLE * 0.5f;
+        car[2] = s->z;
+        car[1] = s->y;
+        ck(chr_in_volume(&pl->sight, car[0], car[1], car[2]),
+           "  the near car is in the volume too", "at %.1f, %.1f", car[0],
+           car[2]);
+        y0 = s->y;
         step_n(&c, car, 5.0f, 60 * 8, 1.0f / 60.0f);
         ck(s->state == CHR_ST_FLY, "  startled, it takes off", "state %d",
            s->state);
@@ -2475,7 +2523,1159 @@ static void part14(void)
     }
 }
 
+/* ================ part 15: nothing unmapped reaches the draw ============== */
+
+/*
+ * THE ROAD CARS' COLLISION BOXES, and this is the check that would have caught
+ * them. Reported four times as "the npc cars are white boxes" and once with
+ * black ones: each of the four road-car models carries five box meshes the
+ * retail engine does not draw -- one round the body, one round each wheel group
+ * -- and pack_chars.py used to pack all five. Every one is 8 verts and 12
+ * triangles with ONE distinct UV for the whole mesh, so drawn it samples a
+ * single texel and comes out flat: hummer_txt's is black, and the Truck's five
+ * carry texture id 0xFFFFFFFF and inherited slot 0, treiler_fara, whose (0,0)
+ * is near-white.
+ *
+ * Two checks, and the first is the general one: NO batch in any shipped .chr
+ * may have a single UV across all its vertices. That is a property of the
+ * geometry, not a name list, and it holds for all 20 boxes and for nothing
+ * else in the cast. The second pins the counts, so reverting the drop fails
+ * here as well as above.
+ */
+static void part15(void)
+{
+    static const struct { const char *model; unsigned int batches; }
+    ROADCAR[] = { { "Hammer", 17 }, { "Trailer", 25 },
+                  { "Truck", 19 },  { "Btr", 11 } };
+    unsigned int t, k;
+    int flat = 0, checked = 0, boxes = 0, counted = 0, wrong = 0;
+    char worst[128];
+
+    printf("\n== 15. no batch is unmapped: the road cars' collision boxes\n");
+    worst[0] = '\0';
+
+    for (t = 0; t < NTRACK; t++) {
+        char path[256];
+        chr_t c;
+        unsigned int i, b;
+
+        snprintf(path, sizeof path, ASSETS "%s.chr", TRACK[t]);
+        if (!char_init(&c, path, TRACK[t], NULL))
+            continue;
+        for (i = 0; i < c.n_models; i++) {
+            const chr_model_t *m = &c.model[i];
+            for (b = 0; b < m->n_batches; b++) {
+                const chr_batch_t *bt = &m->batch[b];
+                unsigned int v;
+                int one = 1;
+                if (!bt->nverts)
+                    continue;
+                checked++;
+                for (v = 1; v < bt->nverts; v++)
+                    if (bt->verts[v * 5 + 3] != bt->verts[3]
+                        || bt->verts[v * 5 + 4] != bt->verts[4]) {
+                        one = 0;
+                        break;
+                    }
+                if (!one)
+                    continue;
+                flat++;
+                if (!worst[0])
+                    snprintf(worst, sizeof worst,
+                             "%s/%s batch %u, %u verts at uv (%.3f, %.3f)",
+                             TRACK[t], m->name, b, bt->nverts,
+                             bt->verts[3], bt->verts[4]);
+                if (bt->nverts == 8 && bt->nidx == 36)
+                    boxes++;
+            }
+            for (k = 0; k < sizeof ROADCAR / sizeof ROADCAR[0]; k++) {
+                if (strcmp(m->name, ROADCAR[k].model))
+                    continue;
+                counted++;
+                if (m->n_batches != ROADCAR[k].batches) {
+                    wrong++;
+                    if (!worst[0])
+                        snprintf(worst, sizeof worst, "%s/%s has %u batches, "
+                                 "expected %u", TRACK[t], m->name,
+                                 m->n_batches, ROADCAR[k].batches);
+                }
+            }
+        }
+        char_free(&c);
+    }
+
+    ck(flat == 0, "no shipped batch has one UV for every vertex",
+       "%d of %d batches%s%s", flat, checked, flat ? " -- " : "",
+       flat ? worst : " across the ten tracks");
+    ck(boxes == 0, "  and no 8-vertex box is packed at all",
+       "%d flat boxes", boxes);
+    ck(counted >= 8 && !wrong,
+       "  the four road cars carry their drawn batches only",
+       "%d road-car models checked%s%s", counted, wrong ? " -- " : "",
+       wrong ? worst : ", 5 boxes dropped from each");
+}
+
 /* ================================================================== main ==== */
+
+/* ================= part 16: they kick it, throw it and shoot at it ========== */
+
+/* step_n with a car HEADING, which the burst's lead needs. */
+static void step_n_fwd(chr_t *c, const float car[3], const float fwd[3],
+                       float speed, int n, float dt)
+{
+    int i;
+    for (i = 0; i < n; i++)
+        char_step(c, dt, car, fwd, speed);
+}
+
+/* Run until an impulse is raised, or `n` steps go by. -> the step it landed on
+   or -1, and the impulse itself through `out`. `hold` keeps the car glued to a
+   fixed offset from the character, which is what a parked car is. */
+static int until_impulse(chr_t *c, unsigned int idx, const float car[3],
+                         const float fwd[3], float speed, int n, float dt,
+                         int *kind, float dv[3], float pt[3], float *at_clip)
+{
+    int i;
+    for (i = 0; i < n; i++) {
+        char_step(c, dt, car, fwd, speed);
+        if (c->inst[idx].imp_kind != CHR_IMP_NONE) {
+            if (kind) *kind = c->inst[idx].imp_kind;
+            if (dv) memcpy(dv, c->inst[idx].imp_dv, 3 * sizeof(float));
+            if (pt) memcpy(pt, c->inst[idx].imp_point, 3 * sizeof(float));
+            if (at_clip) *at_clip = c->inst[idx].clip_t;
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* The centre of a volume's quad, and a y inside its range. Every shipped one is
+   a parallelogram, so the mean of the four corners is inside it. */
+static void vol_centre(const chr_volume_t *v, float o[3])
+{
+    int k;
+    o[0] = o[2] = 0.0f;
+    for (k = 0; k < 4; k++) { o[0] += v->qx[k]; o[2] += v->qz[k]; }
+    o[0] *= 0.25f; o[2] *= 0.25f;
+    o[1] = (v->ylo + v->yhi) * 0.5f;
+}
+
+/* A seed whose FIRST roll of rnd01 lands on the branch wanted. The LCG is
+   char.c's; searching for the seed rather than writing one down means a change
+   to either cannot leave a stale constant behind. */
+static unsigned int seed_for(int want_throw)
+{
+    unsigned int r;
+    for (r = 1; r < 4096u; r++) {
+        unsigned int n = r * 1664525u + 1013904223u;
+        float v = (float)((n >> 16) & 0x7fff) * (1.0f / 32768.0f);
+        if (want_throw ? (v <= CHR_REACT_THROW_P) : (v > CHR_REACT_THROW_P))
+            return r;
+    }
+    return 0;
+}
+
+static void part16(void)
+{
+    chr_t c;
+    int mi;
+    float fwd[3] = { 0.0f, 0.0f, 1.0f };
+    const float DT = 1.0f / 60.0f;
+
+    printf("\n== 16. a person kicks the car, or picks it up and throws it\n");
+    if (!char_init(&c, ASSETS "beach_1.chr", "beach_1", NULL)) {
+        ck(0, "beach_1.chr", "will not load");
+        return;
+    }
+    mi = find_inst(&c, "Man");
+    if (mi < 0) {
+        ck(0, "beach_1 has a Man", "");
+        char_free(&c);
+        return;
+    }
+
+    /* --- the near kick ---------------------------------------------------- */
+    {
+        chr_inst_t *in = &c.inst[mi];
+        float car[3], dv[3], pt[3], at = 0.0f;
+        int kind = 0, k, n2;
+
+        char_reset(&c);
+        in = &c.inst[mi];
+        in->rnd = seed_for(0);
+        /*
+         * A car parked against him: inside CHR_REACT_NEAR (0.8 m) and OUTSIDE
+         * CHR_HIT_RADIUS (0.45), because being run over is a separate reaction
+         * that wins -- it raises the Hurt clip for 4.5 s and then holds a 3 s
+         * cooldown, so a fixture that parks a moving car ON him measures that
+         * and not this. The car is a position here rather than a body, so
+         * bringing it to the character costs nothing, and the Man is a path
+         * replayer whose own pivot is a dummy 85 m from his walk -- the other
+         * way round would measure nothing at all.
+         */
+        car[0] = in->x + (CHR_HIT_RADIUS + CHR_REACT_NEAR) * 0.5f;
+        car[1] = in->y; car[2] = in->z;
+        ck((CHR_HIT_RADIUS + CHR_REACT_NEAR) * 0.5f > CHR_HIT_RADIUS
+               && (CHR_HIT_RADIUS + CHR_REACT_NEAR) * 0.5f < CHR_REACT_NEAR,
+           "the fixture parks the car between the two radii",
+           "%.2f m, run-over %.2f, reaction %.2f",
+           (CHR_HIT_RADIUS + CHR_REACT_NEAR) * 0.5f, CHR_HIT_RADIUS,
+           CHR_REACT_NEAR);
+        k = until_impulse(&c, (unsigned)mi, car, fwd, 1.0f, 600, DT,
+                          &kind, dv, pt, &at);
+        ck(k >= 0 && kind == CHR_IMP_KICK, "a car parked against him is kicked",
+           "kind %d after %d steps", kind, k);
+        ck(in->clip >= 0
+               && !strcmp(c.model[in->model].clip[in->clip].name, "Pendal"),
+           "  in his own Pendal clip -- the artists' word for a kick",
+           "%s", in->clip >= 0 ? c.model[in->model].clip[in->clip].name : "-");
+        /*
+         * IT CONNECTS AT THE RECOVERED CURSOR, not at the start of the swing.
+         * 0x5115c4 tests the clip cursor against the float at 0x554aac -- 0.65
+         * seconds into a clip the .chr says is 3.000 long -- so the impulse
+         * lands two thirds of a second in, and a cursor that wrapped or a
+         * reaction that fired on contact would both miss this by a mile.
+         */
+        ck(near(at, 0.65f, 2.0f * DT),
+           "  and it lands 0.65 s into it, off 0x554aac",
+           "clip_t %.3f s of 3.000", at);
+        /*
+         * WHICH WAY, AND HOW MUCH. 0x51160e and 0x511605 push 4.0 and 7.0 into
+         * 0x4f3470, which normalises (car - person) IN XZ ONLY and adds the
+         * second number along world up. Written out here as a second copy with
+         * the addresses, so a mutant has to break both.
+         *
+         * THE DOMINANCE IS THE POINT: a kick is mostly UP (7 against 4) and a
+         * throw is mostly FORWARD (7 against 4 the other way round), and the
+         * ratio 1.75 is the same for both -- so a check on the ratio alone
+         * cannot tell the two reactions apart and this asserts which component
+         * is the bigger as well.
+         */
+        {
+            float h = sqrtf(dv[0] * dv[0] + dv[2] * dv[2]);
+            float away = dv[0] * (car[0] - in->x) + dv[2] * (car[2] - in->z);
+            ck(near(h, 4.0f, 0.01f) && near(dv[1], 7.0f, 0.01f),
+               "  4.0 m/s away and 7.0 up, off 0x51160e / 0x511605",
+               "%.2f horizontal, %.2f vertical", h, dv[1]);
+            ck(dv[1] > h, "  so a kick POPS the car -- up beats along",
+               "%.2f up against %.2f along", dv[1], h);
+            ck(away > 0.0f, "  and horizontally AWAY from him", "%.2f", away);
+        }
+        /* One swing lands ONCE. The clip is one-shot: a wrapped cursor would
+           re-fire every 3 s of clip and, worse, every frame past 0.65. */
+        {
+            int hits = 0, i;
+            for (i = 0; i < 150; i++) {          /* 2.5 s, inside one clip */
+                char_step(&c, DT, car, fwd, 1.0f);
+                if (in->imp_kind != CHR_IMP_NONE) hits++;
+            }
+            ck(hits == 0, "  and only once inside the one clip",
+               "%d further impulses over the rest of the 3.0 s", hits);
+        }
+        /*
+         * AND HE KEEPS DOING IT. The car has to FOLLOW him for this: he is a
+         * path replayer, and once the reaction ends his recorded walk picks up
+         * again at 0.59 m/s, so a car left at a fixed point is seven metres
+         * behind him inside twelve seconds and the repetition would read as a
+         * reaction that fires once and latches.
+         */
+        {
+            int hits = 0, i;
+            float off = (CHR_HIT_RADIUS + CHR_REACT_NEAR) * 0.5f;
+            for (i = 0; i < 60 * 12; i++) {
+                float f[3] = { 0.0f, 0.0f, 1.0f };
+                car[0] = in->x + off; car[1] = in->y; car[2] = in->z;
+                char_step(&c, DT, car, f, 1.0f);
+                if (in->imp_kind != CHR_IMP_NONE) hits++;
+            }
+            ck(hits >= 2, "  and he keeps at it while it is on him",
+               "%d more swings over 12 s", hits);
+            n2 = hits;
+        }
+        (void)n2;
+    }
+
+    /* --- the three controls, one per clause of 0x510f40 -------------------- */
+    {
+        chr_inst_t *in;
+        float car[3];
+        int k;
+
+        char_reset(&c);
+        in = &c.inst[mi];
+        in->rnd = seed_for(0);
+        /* too far for either clause */
+        car[0] = in->x + CHR_REACT_FAR + 2.0f; car[1] = in->y; car[2] = in->z;
+        k = until_impulse(&c, (unsigned)mi, car, fwd, 6.0f, 600, DT,
+                          NULL, NULL, NULL, NULL);
+        ck(k < 0, "a car further off than CHR_REACT_FAR is left alone",
+           "%.1f m away, %d", CHR_REACT_FAR + 2.0f, k);
+
+        char_reset(&c);
+        in = &c.inst[mi];
+        in->rnd = seed_for(0);
+        /* right on top of him but a metre and a bit above: the height gate */
+        car[0] = in->x; car[1] = in->y + CHR_REACT_DY + 0.5f; car[2] = in->z;
+        k = until_impulse(&c, (unsigned)mi, car, fwd, 6.0f, 600, DT,
+                          NULL, NULL, NULL, NULL);
+        ck(k < 0, "  nor one over his head, whatever the ground distance",
+           "dy %.2f against CHR_REACT_DY %.2f, %d",
+           CHR_REACT_DY + 0.5f, CHR_REACT_DY, k);
+
+        /*
+         * THE RUNNING KICK and its two gates, each shown BOTH ways -- the pair
+         * is what binds the constant, because either check alone passes on a
+         * build that ignores it.
+         */
+        {
+            float slow, fast;
+            char_reset(&c);
+            in = &c.inst[mi];
+            in->rnd = seed_for(0);
+            /* two metres dead ahead of him, so the cone is satisfied */
+            car[0] = in->x + sinf(in->yaw * 3.14159265f / 180.0f) * 2.0f;
+            car[1] = in->y;
+            car[2] = in->z + cosf(in->yaw * 3.14159265f / 180.0f) * 2.0f;
+            slow = CHR_REACT_CAR_SPEED - 1.0f;
+            fast = CHR_REACT_CAR_SPEED + 1.0f;
+            k = until_impulse(&c, (unsigned)mi, car, fwd, slow, 300, DT,
+                              NULL, NULL, NULL, NULL);
+            ck(k < 0, "a car coming at him UNDER 15 km/h is not worth a boot",
+               "%.2f m/s against CHR_REACT_CAR_SPEED %.4f, %d",
+               slow, CHR_REACT_CAR_SPEED, k);
+            char_reset(&c);
+            in = &c.inst[mi];
+            in->rnd = seed_for(0);
+            car[0] = in->x + sinf(in->yaw * 3.14159265f / 180.0f) * 2.0f;
+            car[1] = in->y;
+            car[2] = in->z + cosf(in->yaw * 3.14159265f / 180.0f) * 2.0f;
+            for (k = 0; k < 300 && in->react == CHR_RX_NONE; k++)
+                char_step(&c, DT, car, fwd, fast);
+            ck(in->react == CHR_RX_KICK, "  and one OVER it is", "%.2f m/s, "
+               "react %d after %d steps", fast, in->react, k);
+            /*
+             * BUT A SWING AT TWO METRES HITS NOTHING, and that is the other
+             * half of 0x511470: past CHR_REACT_WINDUP it gives up unless the
+             * car is inside CHR_REACT_KICK_LOST (1.1 m). So the running kick
+             * only connects on a car that keeps coming -- which is the whole
+             * point of a gate on the car's SPEED rather than on its distance.
+             */
+            {
+                int hit = 0, i;
+                for (i = 0; i < 300 && !hit; i++) {
+                    char_step(&c, DT, car, fwd, fast);
+                    if (in->imp_kind != CHR_IMP_NONE) hit = 1;
+                }
+                ck(!hit, "  a swing at two metres connects with nothing",
+                   "%.1f m against CHR_REACT_KICK_LOST %.2f", 2.0f,
+                   CHR_REACT_KICK_LOST);
+            }
+            char_reset(&c);
+            in = &c.inst[mi];
+            in->rnd = seed_for(0);
+            {
+                int hit = 0, i;
+                float d0 = 2.0f;
+                for (i = 0; i < 600 && !hit; i++) {
+                    /* the same approach, DRIVEN IN rather than parked */
+                    float f[3] = { 0.0f, 0.0f, 1.0f };
+                    if (d0 > 0.62f) d0 -= fast * DT * 0.25f;
+                    car[0] = in->x + sinf(in->yaw * 3.14159265f / 180.0f) * d0;
+                    car[1] = in->y;
+                    car[2] = in->z + cosf(in->yaw * 3.14159265f / 180.0f) * d0;
+                    char_step(&c, DT, car, f, fast);
+                    if (in->imp_kind != CHR_IMP_NONE) hit = 1;
+                }
+                ck(hit, "  and one that keeps coming gets booted", "closed to "
+                   "%.2f m", d0);
+            }
+        }
+    }
+
+    /* --- the throw -------------------------------------------------------- */
+    {
+        chr_inst_t *in;
+        float car[3], dv[3], grab_at = -1.0f, rel_at = -1.0f;
+        int i, carried = 0;
+
+        char_reset(&c);
+        in = &c.inst[mi];
+        in->rnd = seed_for(1);
+        car[0] = in->x + (CHR_HIT_RADIUS + CHR_REACT_NEAR) * 0.5f;
+        car[1] = in->y; car[2] = in->z;
+        for (i = 0; i < 60 * 8; i++) {
+            char_step(&c, DT, car, fwd, 1.0f);
+            if (in->carry) {
+                carried++;
+                if (grab_at < 0.0f) grab_at = in->clip_t;
+            }
+            if (in->imp_kind == CHR_IMP_THROW) {
+                rel_at = in->clip_t;
+                memcpy(dv, in->imp_dv, sizeof dv);
+                break;
+            }
+        }
+        ck(in->clip >= 0
+               && !strcmp(c.model[in->model].clip[in->clip].name, "Brosok"),
+           "one time in five he picks it up instead -- his Brosok clip",
+           "%s", in->clip >= 0 ? c.model[in->model].clip[in->clip].name : "-");
+        ck(carried > 0, "  and it really is in his hand for a while",
+           "%d frames carried", carried);
+        ck(near(grab_at, 0.6f, 2.0f * DT),
+           "  off the ground 0.6 s in, off 0x5112eb",
+           "clip_t %.3f s of 4.700", grab_at);
+        ck(near(rel_at, 2.0f, 2.0f * DT),
+           "  and out of the hand at 2.0 s, off 0x510dd7",
+           "clip_t %.3f s", rel_at);
+        {
+            float h = sqrtf(dv[0] * dv[0] + dv[2] * dv[2]);
+            ck(near(h, 7.0f, 0.01f) && near(dv[1], 4.0f, 0.01f),
+               "  7.0 m/s along him and 4.0 up, off 0x510dfe / 0x510e0a",
+               "%.2f along, %.2f up", h, dv[1]);
+            ck(h > dv[1], "  so a throw HURLS the car -- along beats up",
+               "%.2f along against %.2f up", h, dv[1]);
+            /* And it leaves faster than the car can drive. RB_MAX_SPEED is not
+               in this harness's headers; 6.91 m/s is the figure physics.md
+               records for the fastest of the three cars. */
+            ck(h > 6.91f, "  faster than the car's own top speed",
+               "%.2f m/s against 6.91", h);
+        }
+        ck(!in->carry, "  and he is not still holding it", "carry %d",
+           in->carry);
+    }
+
+    /* --- a WALKER's recorded path stops while he swings -------------------- */
+    {
+        chr_inst_t *in;
+        float car[3], t0, t1, t2;
+        int i;
+
+        char_reset(&c);
+        in = &c.inst[mi];
+        in->rnd = seed_for(0);
+        /* let him walk a little first, car nowhere near */
+        car[0] = in->x + 300.0f; car[1] = in->y; car[2] = in->z + 300.0f;
+        step_n(&c, car, 1.0f, 120, DT);
+        t0 = in->path_t;
+        step_n(&c, car, 1.0f, 60, DT);
+        t1 = in->path_t;
+        ck(t1 > t0 + 0.5f, "his recorded walk runs when nothing is happening",
+           "%.2f -> %.2f s", t0, t1);
+        car[0] = in->x + (CHR_HIT_RADIUS + CHR_REACT_NEAR) * 0.5f;
+        car[1] = in->y; car[2] = in->z;
+        for (i = 0; i < 600 && in->react == CHR_RX_NONE; i++)
+            char_step(&c, DT, car, fwd, 1.0f);
+        t1 = in->path_t;
+        step_n(&c, car, 1.0f, 60, DT);
+        t2 = in->path_t;
+        /*
+         * 0x510422 advances the replay only while the animation state is Stand
+         * or Walk, so a person who plants a boot in the car stops walking for
+         * the length of the clip. Bound to ZERO rather than to "less", because
+         * the engine's test is on the state and not on a rate.
+         */
+        ck(in->react != CHR_RX_NONE && near(t2, t1, 1e-4f),
+           "  and STOPS dead while he kicks -- 0x510422's own gate",
+           "%.4f -> %.4f s over a second, react %d", t1, t2, in->react);
+    }
+    char_free(&c);
+}
+
+/* ===================== part 17: the guards shoot back ====================== */
+
+static void part17(void)
+{
+    chr_t c;
+    int gi;
+    float fwd[3] = { 0.0f, 0.0f, 1.0f };
+    const float DT = 1.0f / 60.0f;
+    const chr_watch_t W = CHR_WATCH_GUARD;
+
+    printf("\n== 17. the Guard: its attention machine and its burst\n");
+    if (!char_init(&c, ASSETS "beach_4.chr", "beach_4", NULL)) {
+        ck(0, "beach_4.chr", "will not load");
+        return;
+    }
+    gi = find_inst(&c, "Guard");
+    if (gi < 0) {
+        ck(0, "beach_4 has a Guard", "");
+        char_free(&c);
+        return;
+    }
+    ck(c.model[c.inst[gi].model].n_clips == 3
+           && chr_clip_index(&c.model[c.inst[gi].model], "shoot") >= 0
+           && chr_clip_index(&c.model[c.inst[gi].model], "kick") >= 0,
+       "he carries a `shoot` clip and a `kick` one", "%u clips",
+       c.model[c.inst[gi].model].n_clips);
+
+    /* --- the watcher, and the burst it lets go ----------------------------- */
+    {
+        chr_inst_t *in = &c.inst[gi];
+        const chr_place_t *pl = in->place;
+        float car[3];
+        int i, rounds, bursts, first = -1;
+
+        char_reset(&c);
+        in = &c.inst[gi];
+        /*
+         * Inside BOTH of its volumes and well outside CHR_REACT_NEAR, so this
+         * is the SHOOT case and not the kick. The centre of the guardVolume is
+         * the point that satisfies both: the visibilityVolume is the bigger of
+         * the two and contains it, and a rotated parallelogram is not something
+         * an offset from the guard can be trusted to land inside.
+         */
+        vol_centre(&pl->home, car);
+        ck((pl->have & CHR_VOL_SIGHT) && (pl->have & CHR_VOL_HOME)
+               && chr_in_volume(&pl->sight, car[0], car[1], car[2])
+               && chr_in_volume(&pl->home, car[0], car[1], car[2]),
+           "the fixture's car is in both of his volumes", "at %.1f %.1f %.1f",
+           car[0], car[1], car[2]);
+        ck(sqrtf((car[0] - in->x) * (car[0] - in->x)
+                 + (car[2] - in->z) * (car[2] - in->z)) > CHR_REACT_NEAR,
+           "  and out of kicking range, so this is the burst", "%.1f m",
+           sqrtf((car[0] - in->x) * (car[0] - in->x)
+                 + (car[2] - in->z) * (car[2] - in->z)));
+
+        rounds = bursts = 0;
+        for (i = 0; i < 60 * 2; i++) {
+            char_step(&c, DT, car, fwd, 0.0f);
+            if (in->event == CHR_EV_SHOOT) {
+                bursts++;
+                if (first < 0) first = i;
+            }
+            if (in->imp_kind == CHR_IMP_SHOT) rounds++;
+            if (bursts == 1 && rounds == (int)CHR_BURST_NSHOOTS) break;
+        }
+        /*
+         * THE DWELL IS THE WATCHER'S, NOT guard.ini's. All four of that file's
+         * keys are loaded and none is ever read (see char.c's step_guard), and
+         * the number that decides when he opens fire is the 0.15 pushed at
+         * 0x51a670 -- so a build that used TimeFollow's 1.0 s would be a good
+         * six times late here.
+         */
+        ck(first >= 0 && near((float)first * DT, W.first, 3.0f * DT),
+           "  he opens fire CHR_WATCH_GUARD.first after acquiring",
+           "%.3f s against %.3f", (float)first * DT, W.first);
+        ck(rounds == (int)CHR_BURST_NSHOOTS,
+           "  and a burst is exactly NShoots rounds", "%d of %.0f", rounds,
+           CHR_BURST_NSHOOTS);
+        /* And no more out of that burst, however long it is left running. */
+        {
+            int extra = 0;
+            for (i = 0; i < 60; i++) {
+                char_step(&c, DT, car, fwd, 0.0f);
+                if (in->event == CHR_EV_SHOOT) break;   /* the NEXT burst */
+                if (in->imp_kind == CHR_IMP_SHOT) extra++;
+            }
+            ck(extra == 0, "  and it stops when it is empty", "%d extra",
+               extra);
+        }
+    }
+
+    /* --- it drops the target after CHR_WATCH_GUARD.count attacks ----------- */
+    {
+        chr_inst_t *in;
+        float car[3];
+        int i, bursts = 0, dropped = 0;
+
+        char_reset(&c);
+        in = &c.inst[gi];
+        vol_centre(&in->place->home, car);
+        for (i = 0; i < 60 * 20; i++) {
+            char_step(&c, DT, car, fwd, 0.0f);
+            if (in->event == CHR_EV_SHOOT) bursts++;
+            if (bursts >= W.count + 1 && !in->w_have) { dropped = 1; break; }
+        }
+        /*
+         * 0x535920 increments the attack count and drops the target once it is
+         * past `count`, so a guard works round a field rather than emptying
+         * itself at one car. With one car it re-acquires immediately, which is
+         * why this watches w_have rather than counting the gap between bursts.
+         */
+        ck(dropped, "  and after count+1 bursts he lets that car go and looks "
+                    "again", "%d bursts, %d attacks", bursts, in->w_count);
+    }
+
+    /* --- close up, he kicks instead --------------------------------------- */
+    {
+        chr_inst_t *in;
+        float car[3], dv[3];
+        int kind = 0, k;
+
+        char_reset(&c);
+        in = &c.inst[gi];
+        car[0] = in->x + CHR_REACT_NEAR * 0.5f; car[1] = in->y;
+        car[2] = in->z;
+        k = until_impulse(&c, (unsigned)gi, car, fwd, 1.0f, 600, DT,
+                          &kind, dv, NULL, NULL);
+        ck(k >= 0 && kind == CHR_IMP_KICK,
+           "a car right up against him gets the boot, not the burst",
+           "kind %d after %d steps", kind, k);
+        ck(in->clip >= 0
+               && !strcmp(c.model[in->model].clip[in->clip].name, "kick"),
+           "  in his own `kick` clip", "%s",
+           in->clip >= 0 ? c.model[in->model].clip[in->clip].name : "-");
+        ck(near(dv[1], 7.0f, 0.01f),
+           "  and it is the SAME kick the people use -- 0x511470 is shared",
+           "%.2f up", dv[1]);
+    }
+
+    /* --- the burst leads a moving car ------------------------------------- */
+    {
+        chr_inst_t *in;
+        float car[3], cf[3] = { 1.0f, 0.0f, 0.0f };
+        float aim_still[3], aim_fast[3];
+        int i;
+
+        char_reset(&c);
+        in = &c.inst[gi];
+        vol_centre(&in->place->home, car);
+        aim_still[0] = aim_fast[0] = 0.0f;
+        for (i = 0; i < 60 * 3; i++) {
+            char_step(&c, DT, car, cf, 0.0f);
+            if (in->imp_kind == CHR_IMP_SHOT) {
+                memcpy(aim_still, in->imp_aim, sizeof aim_still);
+                break;
+            }
+        }
+        char_reset(&c);
+        in = &c.inst[gi];
+        for (i = 0; i < 60 * 3; i++) {
+            char_step(&c, DT, car, cf, 5.0f);
+            if (in->imp_kind == CHR_IMP_SHOT) {
+                memcpy(aim_fast, in->imp_aim, sizeof aim_fast);
+                break;
+            }
+        }
+        /*
+         * `Offset` LEADS THE TARGET, and it is scaled by the car's speed in
+         * KM/H (0x52dc8e takes 0x50b6a0's return, which is |v| * 3.6, times
+         * Offset times 0.5). A check on one aim point cannot see that: the same
+         * fixture at two speeds can, and the difference has to be the lead.
+         */
+        {
+            float want = 5.0f * 3.6f * CHR_BURST_OFFSET * CHR_BULLET_LEAD;
+            float got = aim_fast[0] - aim_still[0];
+            ck(near(got, want, 0.05f),
+               "  and it aims ahead of a moving car by Offset x its km/h",
+               "%.2f m of lead against %.2f wanted", got, want);
+        }
+    }
+    char_free(&c);
+}
+
+/* ==================== part 18: the Seagull's own five clips ================= */
+
+/* The far corner of the gull's own visibilityVolume, pulled slightly in: in the
+   volume, so the machine runs, and further off than CHR_GULL_STARTLE, so it
+   stays on the ground. */
+static void gull_watch_pos(const chr_inst_t *in, float car[3])
+{
+    const chr_volume_t *v = &in->place->sight;
+    float cx = 0.0f, cz = 0.0f, best = -1.0f;
+    int k, kb = 0;
+    for (k = 0; k < 4; k++) { cx += v->qx[k]; cz += v->qz[k]; }
+    cx *= 0.25f; cz *= 0.25f;
+    for (k = 0; k < 4; k++) {
+        float dx = v->qx[k] - in->x, dz = v->qz[k] - in->z;
+        if (dx * dx + dz * dz > best) { best = dx * dx + dz * dz; kb = k; }
+    }
+    car[0] = v->qx[kb] + (cx - v->qx[kb]) * 0.1f;
+    car[2] = v->qz[kb] + (cz - v->qz[kb]) * 0.1f;
+    car[1] = (v->ylo + v->yhi) * 0.5f;
+}
+
+static void part18(void)
+{
+    chr_t c;
+    int si;
+    float fwd[3] = { 0.0f, 0.0f, 1.0f };
+    const float DT = 1.0f / 60.0f;
+    const char *seen_idle = "-", *seen_walk = "-", *seen_up = "-";
+    const char *seen_fly = "-";
+    float rate_idle = 0.0f, rate_walk = 0.0f, rate_fly = 0.0f;
+
+    printf("\n== 18. the Seagull walks, and its flight is not in slow motion\n");
+    if (!char_init(&c, ASSETS "beach_1.chr", "beach_1", NULL)) {
+        ck(0, "beach_1.chr", "will not load");
+        return;
+    }
+    si = find_inst(&c, "Seagull");
+    if (si < 0) {
+        ck(0, "beach_1 has a Seagull", "");
+        char_free(&c);
+        return;
+    }
+    {
+        chr_inst_t *in = &c.inst[si];
+        const chr_model_t *m = &c.model[in->model];
+        float car[3];
+        int i, idle_f = 0, walk_f = 0, startle_f = 0;
+
+        ck(chr_clip_index(m, "walk") >= 0 && chr_clip_index(m, "look_around") >= 0
+               && chr_clip_index(m, "flight") >= 0
+               && chr_clip_index(m, "start_flight") >= 0
+               && chr_clip_index(m, "flight_idle") >= 0,
+           "it carries all five of its clips", "%u", m->n_clips);
+
+        /* Undisturbed, on the ground: it must cycle look_around and walk, and
+           nothing else. flight_idle is an AIRBORNE clip and this file used to
+           stand the bird in it. */
+        /*
+         * THE MACHINE IS GATED, and this is the one thing that has to be got
+         * right before any of it can be watched: 0x513040 runs the gull only
+         * while a car is inside its visibilityVolume, so a fixture that parks
+         * the car 300 m away measures the GATE and reports a bird that never
+         * walks. The car goes in the volume and stays out of the 4.0 m startle
+         * -- the same placement part 7's control uses.
+         */
+        char_reset(&c);
+        in = &c.inst[si];
+        gull_watch_pos(in, car);
+        ck(chr_in_volume(&in->place->sight, car[0], car[1], car[2]),
+           "the fixture's car is in its volume and out of its reach",
+           "%.1f m off", sqrtf((car[0] - in->x) * (car[0] - in->x)
+                               + (car[2] - in->z) * (car[2] - in->z)));
+        for (i = 0; i < 60 * 20; i++) {
+            const char *nm;
+            char_step(&c, DT, car, fwd, 0.0f);
+            if (in->clip < 0) continue;
+            nm = m->clip[in->clip].name;
+            if (!strcmp(nm, "walk")) { walk_f++; seen_walk = nm;
+                                       rate_walk = in->clip_rate; }
+            else { idle_f++; seen_idle = nm; rate_idle = in->clip_rate; }
+        }
+        ck(!strcmp(seen_idle, "look_around"),
+           "standing still it is in look_around, not flight_idle", "%s",
+           seen_idle);
+        ck(walk_f > 0 && !strcmp(seen_walk, "walk"),
+           "  and it really does walk", "%d frames of `%s' in 20 s", walk_f,
+           seen_walk);
+        /*
+         * EVERY CLIP AT 1.0. 0x513820 loads the animation rate from 0x554390,
+         * which is 1.0, and computes an index it throws away -- so does
+         * 0x50f7d0 for the people. A 0.7 s walk cycle is a 0.7 s walk cycle,
+         * and the stride_rate this used to go through put the bird at 0.29x:
+         * a gull in slow motion, which is what "the walk animation is missing"
+         * looks like from the outside.
+         */
+        ck(rate_walk == 1.0f && rate_idle == 1.0f,
+           "  and both play at the engine's own 1.0, off 0x554390",
+           "walk %.3f, idle %.3f", rate_walk, rate_idle);
+
+        /* Startled: start_flight, then flight. */
+        char_reset(&c);
+        in = &c.inst[si];
+        car[0] = in->x + CHR_GULL_STARTLE * 0.5f; car[1] = in->y;
+        car[2] = in->z;
+        for (i = 0; i < 60 * 6; i++) {
+            char_step(&c, DT, car, fwd, 0.0f);
+            if (in->clip < 0) continue;
+            if (!strcmp(m->clip[in->clip].name, "start_flight")) {
+                startle_f++;
+                seen_up = "start_flight";
+            } else if (!strcmp(m->clip[in->clip].name, "flight")) {
+                seen_fly = "flight";
+                rate_fly = in->clip_rate;
+            }
+        }
+        ck(!strcmp(seen_up, "start_flight") && !strcmp(seen_fly, "flight"),
+           "startled it plays start_flight and then flight", "%s then %s",
+           seen_up, seen_fly);
+        ck(rate_fly == 1.0f, "  the flight cycle at 1.0 as well", "%.3f",
+           rate_fly);
+        /*
+         * AND THE TWO TIMERS ARE NOT INTERCHANGEABLE. TimeTurn (2.57 s) is how
+         * long it stands looking around and TimeIdle (0.22 s) is the crouch
+         * before it goes up -- and this file had them SWAPPED, so the bird
+         * idled for a fifth of a second and then sat in start_flight for two
+         * and a half. Asserted as the RATIO between the two measured
+         * durations, which no single constant can move: swapping them inverts
+         * it, and it comes out 11.7 either way round in magnitude but the
+         * wrong side of 1.
+         */
+        {
+            float startle_s = (float)startle_f * DT;
+            ck(near(startle_s, CHR_SEAGULL_TIMEIDLE, 3.0f * DT),
+               "  the crouch lasts TimeIdle, not TimeTurn",
+               "%.3f s against TimeIdle %.3f and TimeTurn %.3f", startle_s,
+               CHR_SEAGULL_TIMEIDLE, CHR_SEAGULL_TIMETURN);
+            ck(startle_s < CHR_SEAGULL_TIMETURN * 0.5f,
+               "  which is the shorter of the two, by a factor of ten",
+               "%.3f s against %.3f", startle_s, CHR_SEAGULL_TIMETURN);
+        }
+    }
+    /* And the stand it holds between walks really is TimeTurn long. */
+    {
+        chr_inst_t *in;
+        const chr_model_t *m;
+        float car[3];
+        int i, run = 0, best = 0;
+
+        char_reset(&c);
+        in = &c.inst[si];
+        m = &c.model[in->model];
+        gull_watch_pos(in, car);
+        /*
+         * TWO MINUTES, and it has to be: a leg of the wander is a random point
+         * in an inhabitVolume metres across, walked at SpeedRun's 0.21 m/s, so
+         * one leg alone runs twenty to forty seconds and a thirty-second window
+         * sees a single frame of look_around at the start and nothing else. The
+         * quantity here is the length of the PAUSE between two legs, which
+         * needs at least two legs in the window.
+         */
+        for (i = 0; i < 60 * 120; i++) {
+            char_step(&c, DT, car, fwd, 0.0f);
+            if (in->clip >= 0 && !strcmp(m->clip[in->clip].name, "look_around"))
+                run++;
+            else { if (run > best) best = run; run = 0; }
+        }
+        if (run > best) best = run;
+        ck(near((float)best * DT, CHR_SEAGULL_TIMETURN, 4.0f * DT),
+           "  and the look-around between walks lasts TimeTurn",
+           "%.3f s against %.3f", (float)best * DT, CHR_SEAGULL_TIMETURN);
+    }
+    char_free(&c);
+}
+
+/* ============ part 19: the car FEELS it -- the impulses and the carry ======= */
+
+static void part19(void)
+{
+    chr_t c;
+    col_t col;
+    int mi;
+    float fwd[3] = { 0.0f, 0.0f, 1.0f };
+    const float DT = 1.0f / 60.0f;
+
+    printf("\n== 19. what the car does about being kicked, thrown and shot\n");
+    if (!char_init(&c, ASSETS "beach_1.chr", "beach_1", NULL)) {
+        ck(0, "beach_1.chr", "will not load");
+        return;
+    }
+    if (!col_load(ASSETS "beach_1.col", &col)) {
+        ck(0, "beach_1.col", "will not load");
+        char_free(&c);
+        return;
+    }
+    mi = find_inst(&c, "Man");
+    if (mi < 0) {
+        ck(0, "beach_1 has a Man", "");
+        col_free(&col); char_free(&c);
+        return;
+    }
+
+    /*
+     * THE NO-OP FIRST, the way part 12 opens: two cars driven identically from
+     * the race start, one with char_car_react in the loop. beach_1's characters
+     * are tens of metres away, so a swing that never happens must leave the
+     * handling model bit-for-bit alone.
+     */
+    {
+        rb_car a, b;
+        int step, n = 0;
+        rbcar_init(&a, 0, col_rb_world(&col), TRACKS[0].x, TRACKS[0].y,
+                   TRACKS[0].z, TRACKS[0].yaw);
+        rbcar_init(&b, 0, col_rb_world(&col), TRACKS[0].x, TRACKS[0].y,
+                   TRACKS[0].z, TRACKS[0].yaw);
+        char_reset(&c);
+        for (step = 0; step < 300; step++) {
+            const float *cm = rbcar_matrix(&a);
+            float cp[3] = { cm[12], cm[13], cm[14] };
+            rbcar_step(&a, 1.f, 0.f, 0.f, 0, RBCAR_TICK_DT);
+            rbcar_step(&b, 1.f, 0.f, 0.f, 0, RBCAR_TICK_DT);
+            char_step(&c, RBCAR_TICK_DT, cp, fwd, rbcar_speed(&a));
+            n += char_car_react(&c, &a);
+        }
+        ck(n == 0 && !memcmp(&a.body.x, &b.body.x, sizeof a.body.x)
+               && !memcmp(&a.body.P, &b.body.P, sizeof a.body.P)
+               && !memcmp(&a.body.L, &b.body.L, sizeof a.body.L),
+           "five seconds out of reach is a byte-identical no-op",
+           "%d impulses, |dx| %.2e", n, (double)dist3(a.body.x, b.body.x));
+    }
+
+    /*
+     * AND WHAT A KICK ACTUALLY DOES TO THE CAR. Raised by hand rather than by
+     * driving a car up to a man: the point here is the CONVERSION -- 0x4f3470
+     * multiplies the recovered velocity change by the car's mass and hands it to
+     * 0x4756c0, which is rb_apply_impulse -- and a fixture that has to arrange
+     * a swing first cannot separate that from the swing.
+     */
+    {
+        rb_car a;
+        float v0, v1;
+        rbcar_init(&a, 0, col_rb_world(&col), TRACKS[0].x, TRACKS[0].y,
+                   TRACKS[0].z, TRACKS[0].yaw);
+        char_reset(&c);
+        v0 = a.body.v[1];
+        c.inst[mi].imp_kind = CHR_IMP_KICK;
+        c.inst[mi].imp_point[0] = a.body.x[0];
+        c.inst[mi].imp_point[1] = a.body.x[1];
+        c.inst[mi].imp_point[2] = a.body.x[2];
+        c.inst[mi].imp_dv[0] = 0.0f;
+        c.inst[mi].imp_dv[1] = CHR_REACT_KICK_UP;
+        c.inst[mi].imp_dv[2] = 0.0f;
+        ck(char_car_react(&c, &a) == 1, "a kick reaches the car exactly once",
+           "");
+        v1 = a.body.v[1];
+        /*
+         * THE DELTA IS THE RECOVERED NUMBER, not the recovered number times the
+         * mass: the impulse is dv * m and rb_apply_impulse divides it back out.
+         * Bound to the difference rather than to the value, so a car that was
+         * already moving cannot satisfy it.
+         */
+        ck(near(v1 - v0, CHR_REACT_KICK_UP, 0.01f),
+           "  and it changes the car's speed by exactly the recovered m/s",
+           "%.3f m/s of it, %.3f wanted", v1 - v0, CHR_REACT_KICK_UP);
+        /* AND THE EDGE IS CLEARED BY char_step, which is what stops one swing
+           landing twice: main.c calls the two in that order every frame. */
+        {
+            float car[3] = { 0.0f, 0.0f, 0.0f };
+            char_step(&c, DT, car, fwd, 0.0f);
+            ck(c.inst[mi].imp_kind == CHR_IMP_NONE
+                   && char_car_react(&c, &a) == 0
+                   && near(a.body.v[1], v1, 1e-4f),
+               "  and char_step clears the edge, so one swing lands once",
+               "%.3f m/s after a second call", a.body.v[1] - v1);
+        }
+    }
+
+    /*
+     * THE THROW SETS THE MOMENTUM AND ZEROES THE SPIN -- 0x4f3690 -- which is
+     * why it is not an impulse: a car that was already tumbling leaves the hand
+     * straight, and adding to its momentum would carry whatever it had.
+     */
+    {
+        rb_car a;
+        rbcar_init(&a, 0, col_rb_world(&col), TRACKS[0].x, TRACKS[0].y,
+                   TRACKS[0].z, TRACKS[0].yaw);
+        char_reset(&c);
+        /* give it some of both first, so "set" and "add" cannot agree */
+        a.body.P[0] = 5.0f * a.body.mass;
+        a.body.L[1] = 3.0f;
+        rb_update_inv_inertia_world(&a.body);
+        c.inst[mi].imp_kind = CHR_IMP_THROW;
+        c.inst[mi].imp_dv[0] = CHR_REACT_THROW_FWD;
+        c.inst[mi].imp_dv[1] = CHR_REACT_THROW_UP;
+        c.inst[mi].imp_dv[2] = 0.0f;
+        char_car_react(&c, &a);
+        ck(near(a.body.v[0], CHR_REACT_THROW_FWD, 0.01f)
+               && near(a.body.v[1], CHR_REACT_THROW_UP, 0.01f),
+           "a throw SETS the velocity rather than adding to it",
+           "%.2f, %.2f (it had 5.00 along already)", a.body.v[0], a.body.v[1]);
+        ck(a.body.L[0] == 0.0f && a.body.L[1] == 0.0f && a.body.L[2] == 0.0f,
+           "  and zeroes the spin the lift gave it", "L = %.2f %.2f %.2f",
+           a.body.L[0], a.body.L[1], a.body.L[2]);
+    }
+
+    /*
+     * THE CARRY puts the car in the LHANDeff joint -- by name, and the engine
+     * fails a person outright when that node is missing (0x50f460), so this also
+     * says the port's rig has it.
+     */
+    {
+        rb_car a;
+        chr_inst_t *in;
+        float car[3], hand[3], q0[4];
+        int i, held = 0;
+
+        rbcar_init(&a, 0, col_rb_world(&col), TRACKS[0].x, TRACKS[0].y,
+                   TRACKS[0].z, TRACKS[0].yaw);
+        char_reset(&c);
+        in = &c.inst[mi];
+        in->rnd = seed_for(1);
+        ck(chr_part_index(&c.model[in->model], "LHANDeff") >= 0
+               && chr_part_index(&c.model[in->model], "RHANDeff") >= 0,
+           "the Man's rig carries both hand effectors, by name",
+           "L %d, R %d", chr_part_index(&c.model[in->model], "LHANDeff"),
+           chr_part_index(&c.model[in->model], "RHANDeff"));
+        for (i = 0; i < 60 * 8; i++) {
+            car[0] = in->x + (CHR_HIT_RADIUS + CHR_REACT_NEAR) * 0.5f;
+            car[1] = in->y; car[2] = in->z;
+            char_step(&c, DT, car, fwd, 1.0f);
+            if (char_carrier(&c) >= 0) { held = 1; break; }
+        }
+        ck(held && char_carrier(&c) == mi, "char_carrier names the man holding "
+           "it", "%d", char_carrier(&c));
+        memcpy(q0, a.body.q, sizeof q0);
+        char_carry_car(&c, &a);
+        {
+            float d;
+            /* Where the hand is, measured the way the Dog's BONES proxy is. */
+            hand[0] = hand[1] = hand[2] = 0.0f;
+            {
+                const chr_model_t *m = &c.model[in->model];
+                int b = chr_part_index(m, "LHANDeff");
+                float cy = cosf((in->yaw + m->yaw_off) * 3.14159265f / 180.0f);
+                float sy = sinf((in->yaw + m->yaw_off) * 3.14159265f / 180.0f);
+                float lx, ly, lz;
+                chr_pose(&c, (unsigned)mi);
+                lx = c.world[b][12] * in->scale;
+                ly = c.world[b][13] * in->scale;
+                lz = c.world[b][14] * in->scale;
+                hand[0] = in->x + cy * lx + sy * lz;
+                hand[1] = in->y + ly;
+                hand[2] = in->z - sy * lx + cy * lz;
+            }
+            d = sqrtf(dist2(a.body.x, hand));
+            ck(d < 0.01f, "  and the car is AT that joint, not near it",
+               "%.4f m off", d);
+            /*
+             * AND THE ART AGREES WITH THE CONSTANT, which is the strongest
+             * thing in this file: CHR_REACT_LET_GO_T came out of an immediate
+             * in the code (0x5543c8, read at 0x510dd7) and the Brosok clip
+             * came out of people.sb, and the hand's own highest point over that
+             * clip lands within a frame of it. So the car leaves the hand at
+             * the top of the throw, and two shipped artifacts that know nothing
+             * about each other say the same 2.0 seconds -- which is also what
+             * settles that the cursor the engine tests is in SECONDS and not a
+             * fraction of the clip.
+             */
+            {
+                const chr_model_t *m = &c.model[in->model];
+                int bi = chr_part_index(m, "LHANDeff");
+                int ci = chr_clip_index(m, "Brosok");
+                float peak = -1e9f, at = 0.0f, low = 1e9f;
+                int save = in->clip, i;
+                float savet = in->clip_t;
+                for (i = 0; ci >= 0 && bi >= 0 && i <= 120; i++) {
+                    float t = m->clip[ci].duration * (float)i / 120.0f;
+                    in->clip = ci; in->clip_t = t;
+                    chr_pose(&c, (unsigned)mi);
+                    if (c.world[bi][13] > peak) { peak = c.world[bi][13];
+                                                  at = t; }
+                    if (c.world[bi][13] < low) low = c.world[bi][13];
+                }
+                in->clip = save; in->clip_t = savet;
+                ck(near(at, CHR_REACT_LET_GO_T, 0.05f),
+                   "  and the hand is at its HIGHEST at exactly the recovered "
+                   "release", "peak %.3f m at t=%.2f s, CHR_REACT_LET_GO_T %.2f",
+                   peak, at, CHR_REACT_LET_GO_T);
+                ck(low < 0.3f && peak > 1.2f,
+                   "  the clip really does reach down and lift", "%.3f m up "
+                   "to %.3f m over 4.700 s", low, peak);
+            }
+        }
+        ck(a.body.P[0] == 0.0f && a.body.P[1] == 0.0f && a.body.P[2] == 0.0f
+               && a.body.L[0] == 0.0f && a.body.L[1] == 0.0f
+               && a.body.L[2] == 0.0f,
+           "  and nothing integrates while it is up there", "P and L zeroed");
+        /* It moves WITH the hand: step the man on and the car follows. */
+        {
+            float p0[3];
+            memcpy(p0, a.body.x, sizeof p0);
+            char_step(&c, DT * 10.0f, car, fwd, 1.0f);
+            char_carry_car(&c, &a);
+            ck(dist2(a.body.x, p0) > 1e-8f,
+               "  and it follows the hand rather than hanging in the air",
+               "%.4f m of travel in a sixth of a second",
+               sqrtf(dist2(a.body.x, p0)));
+        }
+        (void)q0;
+    }
+
+    /*
+     * A ROUND THAT MISSES CHANGES NOTHING, and one that lands does. The aim is
+     * the whole test: char_car_react resolves the segment itself, so pointing it
+     * at the car and pointing it away are the only two inputs it takes.
+     */
+    {
+        rb_car a;
+        float v0;
+        rbcar_init(&a, 0, col_rb_world(&col), TRACKS[0].x, TRACKS[0].y,
+                   TRACKS[0].z, TRACKS[0].yaw);
+        char_reset(&c);
+        c.inst[mi].imp_kind = CHR_IMP_SHOT;
+        /*
+         * FROM DIRECTLY ABOVE, and that is not laziness: beach_1's race start
+         * is on a 23-degree slope, so a muzzle eight metres away at chest
+         * height is BELOW the terrain between it and the car and col_segment
+         * rightly stops the round. What this check is about is the sphere test
+         * and the world test, not the terrain -- so the segment goes down a
+         * line nothing can be in the way of.
+         */
+        c.inst[mi].imp_point[0] = a.body.x[0];
+        c.inst[mi].imp_point[1] = a.body.x[1] + 8.0f;
+        c.inst[mi].imp_point[2] = a.body.x[2];
+        c.inst[mi].imp_aim[0] = a.body.x[0];
+        c.inst[mi].imp_aim[1] = a.body.x[1];
+        c.inst[mi].imp_aim[2] = a.body.x[2];
+        v0 = sqrtf(a.body.v[0] * a.body.v[0] + a.body.v[1] * a.body.v[1]
+                   + a.body.v[2] * a.body.v[2]);
+        ck(char_car_react(&c, &a) == 1, "a round aimed at the car lands", "");
+        ck(sqrtf(a.body.v[0] * a.body.v[0] + a.body.v[1] * a.body.v[1]
+                 + a.body.v[2] * a.body.v[2]) > v0 + 1.0f,
+           "  and shoves it", "%.2f -> %.2f m/s", v0,
+           sqrtf(a.body.v[0] * a.body.v[0] + a.body.v[1] * a.body.v[1]
+                 + a.body.v[2] * a.body.v[2]));
+        rbcar_init(&a, 0, col_rb_world(&col), TRACKS[0].x, TRACKS[0].y,
+                   TRACKS[0].z, TRACKS[0].yaw);
+        c.inst[mi].imp_kind = CHR_IMP_SHOT;
+        c.inst[mi].imp_point[0] = a.body.x[0];
+        c.inst[mi].imp_point[1] = a.body.x[1] + 8.0f;
+        c.inst[mi].imp_point[2] = a.body.x[2];
+        /* The same muzzle, aimed thirty metres to one side: no reach can turn
+           that into a hit, and the sweep is what makes this the common case. */
+        c.inst[mi].imp_aim[0] = a.body.x[0] + 30.0f;
+        c.inst[mi].imp_aim[1] = a.body.x[1] + 8.0f;
+        c.inst[mi].imp_aim[2] = a.body.x[2];
+        ck(char_car_react(&c, &a) == 0, "  and one aimed past it does not",
+           "");
+    }
+    col_free(&col);
+    char_free(&c);
+
+    /*
+     * AND END TO END, which is the check none of the above is: a real Guard, a
+     * real car standing in its guardVolume on the real grid, and nothing driven
+     * by hand. Everything between the attention machine and the car's momentum
+     * has to work for this to move.
+     */
+    if (char_init(&c, ASSETS "beach_4.chr", "beach_4", NULL)
+        && col_load(ASSETS "beach_4.col", &col)) {
+        int gi = find_inst(&c, "Guard");
+        if (gi < 0) {
+            ck(0, "beach_4 has a Guard", "");
+        } else {
+            rb_car a;
+            chr_inst_t *in;
+            float car[3], gy, nx, ny, nz;
+            int i, landed = 0, fired = 0;
+            char_reset(&c);
+            in = &c.inst[gi];
+            vol_centre(&in->place->home, car);
+            /* On the ground under that point, not at the volume's mid-height:
+               a car dropped in mid-air falls out of the fixture. */
+            if (col_ground_at(&col, car[0], car[2], car[1] + 4.0f, &gy,
+                              &nx, &ny, &nz))
+                car[1] = gy;
+            rbcar_init(&a, 0, col_rb_world(&col), car[0], car[1], car[2],
+                       0.0f);
+            for (i = 0; i < 60 * 10; i++) {
+                const float *cm = rbcar_matrix(&a);
+                float cp[3] = { cm[12], cm[13], cm[14] };
+                float cf[3] = { cm[8], cm[9], cm[10] };
+                rbcar_step(&a, 0.f, 0.f, 0.f, 0, RBCAR_TICK_DT);
+                char_step(&c, RBCAR_TICK_DT, cp, cf, rbcar_speed(&a));
+                if (in->imp_kind == CHR_IMP_SHOT) fired++;
+                landed += char_car_react(&c, &a);
+            }
+            ck(fired >= (int)CHR_BURST_NSHOOTS,
+               "a guard standing over a parked car really does open fire",
+               "%d rounds in ten seconds", fired);
+            ck(landed > 0, "  and some of them land on it",
+               "%d of %d, over a burst that sprays +-%.1f m", landed, fired,
+               CHR_BURST_RADIUS);
+            ck(landed < fired,
+               "  and some of them miss -- the sweep is what makes it a spray",
+               "%d of %d landed", landed, fired);
+        }
+        col_free(&col);
+        char_free(&c);
+    } else {
+        ck(0, "beach_4.chr + .col", "will not load");
+    }
+}
 
 int main(int argc, char **argv)
 {
@@ -2496,6 +3696,11 @@ int main(int argc, char **argv)
     part12();
     part13();
     part14();
+    part15();
+    part16();
+    part17();
+    part18();
+    part19();
     printf("\n%d checks, %d failures\n", checks, fails);
     return fails ? 1 : 0;
 }

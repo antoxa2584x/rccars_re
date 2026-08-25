@@ -9,8 +9,8 @@ static int w_sphere(void*c_,const float c[3],float r,rb_world_hit*h,int mx,int*n
     (void)c_;(void)mx;*n=0; if(fabsf(c[1])>r) return 0;
     h[0].point[0]=c[0];h[0].point[1]=0;h[0].point[2]=c[2];h[0].surface=0;*n=1;return 1;}
 static int w_seg(void*c_,const float a[3],const float b[3]){(void)c_;return (a[1]>0.f)!=(b[1]>0.f);}
-static int w_wat(void*c_,int w,float*g){(void)c_;(void)w;(void)g;return 0;}
-static int w_gnd(void*c_,float x,float z,float*y,float n[3]){(void)c_;(void)x;(void)z;
+static int w_wat(void*c_,int w,const float*ct,float*g){(void)c_;(void)w;(void)ct;(void)g;return 0;}
+static int w_gnd(void*c_,float x,float z,float cy,float*y,float n[3]){(void)c_;(void)cy;(void)x;(void)z;
     *y=0;n[0]=0;n[1]=1;n[2]=0;return 1;}
 static const rb_world W={w_sphere,w_seg,w_wat,w_gnd,0};
 int main(void){

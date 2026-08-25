@@ -19,6 +19,19 @@ Conversions, by loader:
       AngleAzimuth    raw                       (degrees)
       AngleElevation  raw                       (degrees)
 
+  FUN_005323a0   "car_lmshd"      alphavel raw/100, deltaalpha raw/100,
+                                  maxdist raw/1 -- three cfgGetInt-over-a-
+                                  divisor calls through FUN_00532410, plus
+                                  Splines/light_car.bspl loaded by name. This is
+                                  the CAR'S OWN LIGHTMAP SHADOW: see
+                                  FUN_00531ff0, which samples the level lightmap
+                                  under the four wheels and chases the result
+  FUN_004f98e0   "LOD"            DistLOD1SwitchOn / Delta12 / Delta23, each
+                                  remapLinear(raw, 1..100 -> 20..120) * 0.1
+                                  metres and ACCUMULATED, so the three distances
+                                  are 2.00, 4.30 and 6.60 m. carVisualBody
+                                  (0x005077e0) fades the car's own lighting to
+                                  flat between the first two
   FUN_0052b370   "anim_cp"        every key raw * 0.01
   FUN_0051cef0   "WaterLOD_Coast" HeightOn/Off (raw-100)*0.01, ScrollVel raw*0.01,
                                   Alpha* raw/255, ActiveRad raw
@@ -55,6 +68,7 @@ import os
 import re
 import struct
 
+import bspl2csv
 from dump_physics import read_crs
 
 CARS = (1, 2, 3)
@@ -319,6 +333,39 @@ def wsurf_row(track, sec):
     return body + "\n"
 
 
+def lod_dist(raw):
+    """LOD.ini's own conversion, read at 0x004f98f9 and again twice below it.
+
+    The idiom is the engine's remapLinear over the slider's declared range:
+    raw 1..100 maps onto 20..120, clamped at both ends, and the result is
+    scaled by 0.1 -- so 1 gives 2.0 m and 100 gives 12.0 m. The three keys are
+    CUMULATIVE (each is stored as itself plus the one before), which is what
+    makes them switch distances rather than three independent numbers.
+    """
+    if raw < 1:
+        v = 20.0
+    elif raw > 100:
+        v = 120.0
+    else:
+        v = (raw - 1.0) * (100.0 / 99.0) + 20.0
+    return v * 0.1
+
+
+def light_curve(spldir):
+    """Splines/light_car.bspl -- the lightmap-to-car-brightness curve.
+
+    FUN_00531ff0 evaluates it at `mean lightmap RGB * 255` and divides the
+    answer by 255 again, so both axes are 0..255 and the file's own numbers are
+    the ones to emit. Two control points, which under the engine's own evaluator
+    (0x0040f830, clamped piecewise linear -- rb_curve_eval in this port) is a
+    line between them and a clamp outside.
+    """
+    curves = bspl2csv.decode(os.path.join(spldir, "light_car.bspl"))
+    if not curves or len(curves[0]) < 2:
+        raise SystemExit("light_car.bspl: no curve")
+    return [(p[1], p[2]) for p in curves[0]]
+
+
 def emit(f, name, value, comment):
     if isinstance(value, float):
         f.write(f"#define {name:<26} {value:.6f}f   /* {comment} */\n")
@@ -330,11 +377,19 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", default="/mnt/c/tools/rccars_extracted/Settings")
     ap.add_argument("--level", default="beach_1")
+    ap.add_argument("--splines",
+                    default="/mnt/c/tools/rccars_extracted/Splines")
     ap.add_argument("-o", "--out", default="/mnt/c/tools/rccars_vita/vis_data.h")
     a = ap.parse_args()
 
     car_render = Section(a.dir, "carRender")
     car_light = Section(a.dir, "carLight")
+    car_lmshd = Section(a.dir, "car_lmshd")
+    # LOD.crs OVERRIDES the .ini here and the difference matters: Delta12 ships
+    # as 60 in the .ini (7.96 m) and 4 in the .crs (2.30 m), which is what puts
+    # the car's lighting fade at 4.30 m instead of 9.96 and makes this feature
+    # almost entirely about the car the camera is following.
+    lod = Section(a.dir, "LOD")
     anim_cp = Section(a.dir, "anim_cp")
     coast = Section(a.dir, "waterLOD_coast")
     stream = Section(a.dir, "waterLOD_stream")
@@ -387,6 +442,56 @@ def main():
              "CarLight AngleElevation")
         emit(f, "LIGHT_AMBIENT", car_light.raw("AmbientI"), "CarLight AmbientI")
         emit(f, "LIGHT_DIRECT", car_light.raw("DirectI"), "CarLight DirectI")
+
+        # ---- the car's own lighting, and the lightmap shadow that drives it.
+        #
+        # carVisualBody 0x005077e0: one DIRECTIONAL light and one ambient, both
+        # GREY -- the six CarLight R/G/B keys are declared in the .ini, are all
+        # 255, and the loader at 0x004f9aa0 does not read them, so there is
+        # nothing to emit. The two intensities are BYTES scaled by the car's
+        # light level, clamped at 255 and greyed:
+        #
+        #     ambient = min(255, AmbientI * level)      -> D3DRS_AMBIENT
+        #     diffuse = min(255, DirectI  * level)      -> the light's colour
+        #
+        # 138 and 128 out of 255, so a face square to the sun renders at 1.04x
+        # its texture and a face facing away at 0.54x -- the whole range the
+        # highlight has to work in, and the reason the car reads as plastic.
+        f.write("\n/* ---- the car's own light: carVisualBody 0x005077e0, "
+                "and the LOD fade ---- */\n\n")
+        near = lod_dist(lod.raw("DistLOD1SwitchOn"))
+        far = near + lod_dist(lod.raw("Delta12"))
+        emit(f, "LIGHT_FADE_NEAR", near,
+             "LOD DistLOD1SwitchOn: full lighting closer than this, metres")
+        emit(f, "LIGHT_FADE_FAR", far,
+             "+ Delta12: flat (ambient 255, no light) beyond this")
+
+        # ---- car_lmshd: the level's lightmap, sampled under the wheels.
+        # FUN_00531ff0 averages FUN_004572c0's answer -- the mean of the
+        # lightmap texel's RGB at the contact point -- over the wheels that
+        # have one, runs it through light_car.bspl, and CHASES that with a
+        # dead band. FUN_004572c0 is gated on Video/VIDEO_LightMaps and the
+        # whole step on Video/VIDEO_Light.
+        f.write("\n/* ---- car_lmshd: the lightmap under the wheels "
+                "(FUN_00531ff0 / FUN_005323a0) ---- */\n\n")
+        emit(f, "LIGHT_LM_ALPHAVEL", car_lmshd.raw("alphavel") / 100.0,
+             "car_lmshd alphavel/100: light level chase, per second")
+        emit(f, "LIGHT_LM_DELTA", car_lmshd.raw("deltaalpha") / 100.0,
+             "deltaalpha/100: dead band, below which nothing moves")
+        emit(f, "LIGHT_LM_MAXDIST", float(car_lmshd.raw("maxdist")),
+             "maxdist: no camera within this of the car -> level 1.0, metres")
+        pts = light_curve(a.splines)
+        f.write("/* Splines/light_car.bspl: lightmap brightness (0..255) -> "
+                "the\n"
+                "   car's light level (0..255). Clamped piecewise linear, the\n"
+                "   engine's own 0x0040f830 -- so %.3f at or below %.1f and\n"
+                "   %.3f at or above %.1f, a line between. Which is why a tunnel\n"
+                "   darkens the car by a bit over a third and no more. */\n"
+                % (pts[0][1] / 255.0, pts[0][0],
+                   pts[-1][1] / 255.0, pts[-1][0]))
+        f.write("#define LIGHT_LM_CURVE_N %d\n" % len(pts))
+        f.write("#define LIGHT_LM_CURVE { %s }\n"
+                % ", ".join("{%.6ff, %.6ff}" % (i, o) for i, o in pts))
 
         # ------------------------------------------------------ checkpoints
         f.write("\n/* ---- checkpoint markers: FUN_0052b370 (anim_cp), drawn by FUN_0052abc0 ---- */\n\n")

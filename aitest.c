@@ -1174,6 +1174,12 @@ static void part8(void)
         col_free(&col);
         return;
     }
+    /* THE DECISION IS HELD OFF HERE. This fixture is about the REACTION --
+       the contact solve's two-moving-bodies relative velocity and its pair
+       denominator -- and it needs an opponent that arrives. One that steers
+       round the parked player measures nothing about either. The decision
+       has part 10. See ai_t.steer_off. */
+    ai.steer_off = 1;
     ox = ai.car[0].rb.body.x[0];
     oy = ai.car[0].rb.body.x[1];
     oz = ai.car[0].rb.body.x[2];
@@ -1647,6 +1653,12 @@ static void part9(void)
         col_free(&col);
         return;
     }
+    /* THE DECISION IS HELD OFF HERE. This fixture is about the REACTION --
+       the contact solve's two-moving-bodies relative velocity and its pair
+       denominator -- and it needs an opponent that arrives. One that steers
+       round the parked player measures nothing about either. The decision
+       has part 10. See ai_t.steer_off. */
+    ai.steer_off = ref.steer_off = 1;
     if (!spine_build(&sp, &ref.car[0])) {
         ck(0, "spine built");
         return;
@@ -1926,6 +1938,12 @@ static void part9(void)
             col_free(&col);
             return;
         }
+        /* THE DECISION IS HELD OFF HERE. This fixture is about the REACTION --
+           the contact solve's two-moving-bodies relative velocity and its pair
+           denominator -- and it needs an opponent that arrives. One that steers
+           round the parked player measures nothing about either. The decision
+           has part 10. See ai_t.steer_off. */
+        h.steer_off = 1;
         ck(h.car[0].car == 2 && RB_CARS[h.car[0].car].nwheels == 6,
            "country_3's first opponent is the Hummer (%s, %d wheels, %d proxy"
            " spheres)", h.car[0].name, RB_CARS[h.car[0].car].nwheels,
@@ -2127,12 +2145,21 @@ static void part9(void)
     {
         int t, bad_limit = 0, bad_end = 0, touched_tracks = 0;
         float worst_off = 0.0f, worst_ov = 0.0f;
-        int worst_track = -1;
+        /* AND HOW FAR OFF THE GROUND, which is a SEPARATE question from how far
+         * off the line and is the one this survey used to leave unasked. The
+         * offset budget is one magnitude over all three axes, so a field that
+         * spends the whole of it STRAIGHT UP satisfies every bound above --
+         * which is exactly what shipped: country_1 flew two of its three cars at
+         * 0.596 and 0.618 m of lift, on cars a quarter of a metre tall, and
+         * "no opponent ever passes its own bump limit" reported zero violations
+         * the whole time. See ai_pair_resolve on the ratchet that did it. */
+        float worst_up = 0.0f, up_bound = 0.0f;
+        int bad_up = 0, worst_track = -1, up_track = -1, moved_tracks = 0;
 
         for (t = 0; t < AI_N_RACES; t++) {
             ai_t f;
             char path[128];
-            int c, d, touched = 0;
+            int c, d, touched = 0, moved = 0;
             float far3[3];
 
             snprintf(path, sizeof(path), ASSETS "/%s.col", AI_RACES[t].track);
@@ -2150,18 +2177,45 @@ static void part9(void)
             for (i = 0; i < 60 * 60; i++) {
                 ai_step(&f, NULL, far3[0], far3[1], far3[2], 0, 1.0f / 60.0f);
                 for (c = 0; c < f.n; c++) {
+                    float sp[RB_MAX_SPHERES][4], lo = 1e30f, hi = -1e30f, tall;
+                    int ns, q;
+
+                    /* "MOVED", NOT "TOUCHED" -- and since the steering decision
+                       exists those are two different things. `bump` is |off| and
+                       the decision writes off, so counting it as a contact makes
+                       every track report opponents touching the moment one of
+                       them chooses a line round another. What touching means is
+                       proxies overlapping, and that is measured below. */
                     if (f.car[c].bump > 0.0f)
-                        touched = 1;
+                        moved = 1;
                     if (f.car[c].bump > f.car[c].bump_limit + 1e-3f)
                         bad_limit++;
                     if (f.car[c].bump > worst_off) {
                         worst_off = f.car[c].bump;
                         worst_track = t;
                     }
+                    /* ONE CAR HEIGHT, off the car's own proxy rather than typed
+                       in: a bump may put an opponent on top of another opponent
+                       and that is the most a contact can honestly do. */
+                    ns = rb_gather_spheres(&f.car[c].rb, sp);
+                    for (q = 0; q < ns; q++) {
+                        if (sp[q][1] - sp[q][3] < lo) lo = sp[q][1] - sp[q][3];
+                        if (sp[q][1] + sp[q][3] > hi) hi = sp[q][1] + sp[q][3];
+                    }
+                    tall = ns > 0 ? hi - lo : 0.25f;
+                    if (f.car[c].off[1] > worst_up) {
+                        worst_up = f.car[c].off[1];
+                        up_track = t;
+                        up_bound = tall;
+                    }
+                    if (f.car[c].off[1] > tall)
+                        bad_up++;
                 }
                 for (c = 0; c < f.n; c++)
                     for (d = c + 1; d < f.n; d++) {
                         float ov = proxy_overlap(&f.car[c].rb, &f.car[d].rb);
+                        if (ov > 0.0f)
+                            touched = 1;
                         if (ov > worst_ov)
                             worst_ov = ov;
                     }
@@ -2176,12 +2230,15 @@ static void part9(void)
                     bad_end++;
             if (touched)
                 touched_tracks++;
+            if (moved)
+                moved_tracks++;
             ai_free(&f);
             col_free(&col);
         }
-        printf("       ten tracks, a minute each: %d of them have opponents that"
-               " touch, worst offset %.3f m (%s), worst overlap %.3f m\n",
-               touched_tracks, worst_off,
+        printf("       ten tracks, a minute each: %d of them have opponents"
+               " whose proxies actually TOUCH and %d where one moves off its"
+               " line at all, worst offset %.3f m (%s), worst overlap %.3f m\n",
+               touched_tracks, moved_tracks, worst_off,
                worst_track >= 0 ? AI_RACES[worst_track].track : "-", worst_ov);
         ck(bad_limit == 0, "no opponent ever passes its own bump limit"
                            " (%d violations)", bad_limit);
@@ -2190,6 +2247,322 @@ static void part9(void)
         ck(worst_ov < 0.10f,
            "and two opponents are never more than %.3f m inside each other",
            worst_ov);
+        ck(bad_up == 0,
+           "and none of them is ever lifted more than one car height off its own"
+           " line (worst %.3f m on %s, against a %.3f m car; %d violations)",
+           worst_up, up_track >= 0 ? AI_RACES[up_track].track : "-", up_bound,
+           bad_up);
+    }
+}
+
+
+/* ---------------------------------------------------------------------------
+ * part 10 -- THE STEERING DECISION
+ *
+ * Part 9 measures what happens when an opponent is HIT. This measures what
+ * happens when it can see the hit coming: it looks 2.7 m up its own recorded
+ * path, and if a car is in the corridor it picks a side and goes round.
+ *
+ * Every check here is against a TWIN with ai_t.steer_off set -- the same track,
+ * the same profile, the same tick count, the decision the only difference -- so
+ * "it avoided" is a comparison and not an assertion, and so is "it changed
+ * nothing when there was nothing to avoid".
+ */
+static void part10(void)
+{
+    col_t col;
+    int i;
+
+    printf("\npart 10: the steering decision\n");
+
+    /* ---- 1. A NO-OP WITH NOTHING IN THE WAY, and BIT-IDENTICAL.
+     *
+     * The decision writes the same offset a shove does, so the first thing it
+     * has to be is invisible when there is nothing to decide about. Not "close":
+     * an unobstructed opponent must be the same car it was before this existed,
+     * because every measurement in this file is taken on one. */
+    {
+        ai_t on, off;
+        float far3[3];
+        int diff = 0;
+
+        memset(&col, 0, sizeof(col));
+        if (!col_load(ASSETS "/beach_1.col", &col)) {
+            ck(0, "beach_1.col loaded");
+            return;
+        }
+        memset(&on, 0, sizeof(on));
+        memset(&off, 0, sizeof(off));
+        if (ai_init(&on, 0, ASSETS, col_rb_world(&col), 1, 0) < 1
+            || ai_init(&off, 0, ASSETS, col_rb_world(&col), 1, 0) < 1) {
+            ck(0, "beach_1 opponents loaded");
+            col_free(&col);
+            return;
+        }
+        off.steer_off = 1;
+        /* ONE CAR. The property under test is "nothing in the corridor changes
+           nothing", and beach_1's three opponents pass close enough to each
+           other to have something in the corridor -- which is the FEATURE, and
+           part 10's third case measures it. Cutting the field to one leaves a
+           car with an empty world, which is the case that has to be inert. */
+        on.n = off.n = 1;
+        far3[0] = on.car[0].rb.body.x[0] + 1000.0f;
+        far3[1] = on.car[0].rb.body.x[1];
+        far3[2] = on.car[0].rb.body.x[2] + 1000.0f;
+        for (i = 0; i < 60 * 30; i++) {
+            int c;
+            ai_step(&on,  NULL, far3[0], far3[1], far3[2], 0, 1.0f / 60.0f);
+            ai_step(&off, NULL, far3[0], far3[1], far3[2], 0, 1.0f / 60.0f);
+            for (c = 0; c < on.n; c++) {
+                if (memcmp(on.car[c].rb.body.x, off.car[c].rb.body.x,
+                           sizeof(on.car[c].rb.body.x)) != 0
+                    || memcmp(on.car[c].rb.body.q, off.car[c].rb.body.q,
+                              sizeof(on.car[c].rb.body.q)) != 0
+                    || on.car[c].cursor != off.car[c].cursor
+                    || on.car[c].u != off.car[c].u
+                    || on.car[c].dist != off.car[c].dist)
+                    diff++;
+            }
+        }
+        ck(diff == 0,
+           "with no player near, thirty seconds of beach_1 is BIT-IDENTICAL with"
+           " the decision on and off (%d divergent car-ticks of %d)",
+           diff, 60 * 30 * on.n);
+        ai_free(&on);
+        ai_free(&off);
+        col_free(&col);
+    }
+
+    /* ---- 2. IT GOES ROUND A PARKED PLAYER, AND THE REPLAY NEVER KNOWS.
+     *
+     * The same fixture part 9 rams with: a Buggy parked sideways across
+     * country_3's Hummer's own recorded line, six metres up the path. With the
+     * decision off the Hummer drives into it -- that is part 9's whole subject.
+     * With it on the Hummer should pass without touching, and the replay behind
+     * it should be untouched to the BIT, exactly as a bump leaves it.
+     */
+    {
+        ai_t h, ref;
+        rb_car pl, pl2;
+        const rb_world *w;
+        float gy, nx, ny, nz, start[3];
+        float run_m = 0.0f, worst_ov_on = 0.0f, worst_ov_off = 0.0f;
+        float near_on = 1e9f, near_off = 1e9f;
+        float widest = 0.0f, yaw_peak = 0.0f;
+        float bang_on = 0.0f, bang_off = 0.0f;
+        int k = 0, hit_on = 0, hit_off = 0, replay_diff = 0, flips = 0;
+        int last_side = 0;
+
+        memset(&col, 0, sizeof(col));
+        if (!col_load(ASSETS "/country_3.col", &col)) {
+            ck(0, "country_3.col loaded");
+            return;
+        }
+        w = col_rb_world(&col);
+        memset(&h, 0, sizeof(h));
+        memset(&ref, 0, sizeof(ref));
+        if (ai_init(&h, 6, ASSETS, w, 1, 0) < 1
+            || ai_init(&ref, 6, ASSETS, w, 1, 0) < 1) {
+            ck(0, "country_3 opponents loaded");
+            col_free(&col);
+            return;
+        }
+        ref.steer_off = 1;
+        /* ONE OPPONENT. country_3's three start 0.74 and 1.40 m apart and their
+           three recordings run nose to tail for the lap, so a three-car field
+           makes this fixture mostly about the Hummer and its team-mates. What is
+           under test is the pass round the PARKED PLAYER. */
+        h.n = ref.n = 1;
+
+        while (k + 1 < h.car[0].n && run_m < 6.0f) {
+            const ai_sample *s0 = &h.car[0].s[k], *s1 = &h.car[0].s[k + 1];
+            run_m += dist3(s1->p, s0->p);
+            k++;
+        }
+        start[0] = h.car[0].s[k].p[0];
+        start[2] = h.car[0].s[k].p[2];
+        if (!col_ground_at(&col, start[0], start[2], 1e9f, &gy, &nx, &ny, &nz))
+            gy = h.car[0].s[k].p[1];
+        start[1] = gy;
+        rbcar_init(&pl,  1, w, start[0], gy, start[2], 90.0f);
+        rbcar_init(&pl2, 1, w, start[0], gy, start[2], 90.0f);
+
+        /* TWELVE SECONDS, not six. Six is how long the Hummer takes to REACH the
+           parked car -- part 9's own phase A reports one contact tick over it --
+           so a six-second window measures the approach and not the pass. */
+        for (i = 0; i < 60 * 12; i++) {
+            float ov, wide, hb;
+            int c;
+
+            ai_step(&h,   NULL, pl.body.x[0],  pl.body.x[1],  pl.body.x[2],
+                    0, 1.0f / 60.0f);
+            ai_step(&ref, NULL, pl2.body.x[0], pl2.body.x[1], pl2.body.x[2],
+                    0, 1.0f / 60.0f);
+            hb = ai_collide_player(&h, &pl, 1.0f / 60.0f);
+            if (hb > 0.0f) { hit_on++; if (hb > bang_on) bang_on = hb; }
+            hb = ai_collide_player(&ref, &pl2, 1.0f / 60.0f);
+            if (hb > 0.0f) { hit_off++; if (hb > bang_off) bang_off = hb; }
+            rbcar_step(&pl,  0.0f, 0.0f, 0.0f, 0, 1.0f / 60.0f);
+            rbcar_step(&pl2, 0.0f, 0.0f, 0.0f, 0, 1.0f / 60.0f);
+
+            ov = proxy_overlap(&pl, &h.car[0].rb);
+            if (ov > worst_ov_on)
+                worst_ov_on = ov;
+            ov = proxy_overlap(&pl2, &ref.car[0].rb);
+            if (ov > worst_ov_off)
+                worst_ov_off = ov;
+            /* HOW CLOSE IT ACTUALLY GOT, centre to centre -- the width of the
+               pass, which "it moved" and "it yawed" do not measure at all. */
+            {
+                float d = dist3(h.car[0].rb.body.x, pl.body.x);
+                if (d < near_on) near_on = d;
+                d = dist3(ref.car[0].rb.body.x, pl2.body.x);
+                if (d < near_off) near_off = d;
+            }
+
+            wide = h.car[0].steer_want < 0.0f ? -h.car[0].steer_want
+                                              :  h.car[0].steer_want;
+            if (wide > widest)
+                widest = wide;
+            /* A WEAVE IS A SIDE CHANGE WITHOUT AN INTERVENING RELEASE. Going
+               left round one car and right round the next one two seconds later
+               is two decisions, not a weave, so the counter has to reset through
+               zero rather than remember the last non-zero side. */
+            if (h.car[0].steer_side == 0)
+                last_side = 0;
+            else {
+                if (last_side != 0 && h.car[0].steer_side != last_side)
+                    flips++;
+                last_side = h.car[0].steer_side;
+            }
+            {
+                float y = h.car[0].off_yaw < 0.0f ? -h.car[0].off_yaw
+                                                  :  h.car[0].off_yaw;
+                if (y > yaw_peak)
+                    yaw_peak = y;
+            }
+            /* THE REPLAY, BIT FOR BIT, against the twin that did not steer.
+               This is the guarantee the whole design rests on: a decision may
+               touch the offset and NOTHING else. */
+            for (c = 0; c < h.n; c++)
+                if (h.car[c].cursor != ref.car[c].cursor
+                    || h.car[c].u != ref.car[c].u
+                    || h.car[c].lap != ref.car[c].lap
+                    || h.car[c].dist != ref.car[c].dist
+                    || h.car[c].speed != ref.car[c].speed
+                    || h.car[c].speed_rec != ref.car[c].speed_rec
+                    || h.car[c].coeff != ref.car[c].coeff
+                    || memcmp(h.car[c].rec_x, ref.car[c].rec_x,
+                              sizeof(h.car[c].rec_x)) != 0)
+                    replay_diff++;
+        }
+
+        printf("       parked Buggy on the Hummer's line, twelve seconds:"
+               " overlap %.3f m and %.2f m/s of bang deciding, against %.3f m"
+               " and %.2f m/s not; it moved %.3f m across and held %.1f deg\n",
+               worst_ov_on, bang_on, worst_ov_off, bang_off, widest,
+               yaw_peak * 57.29577951f);
+        /* BOTH ENDS, because "it never touched" is also what a broken fixture
+           says. The twin has to hit for the pass to mean anything. */
+        ck(hit_off > 0 && worst_ov_off > 0.01f,
+           "  the twin that does not steer DOES drive into the parked player"
+           " (%d contact ticks, %.3f m of overlap, %.2f m/s)",
+           hit_off, worst_ov_off, bang_off);
+        /* IT TURNS A HIT INTO A GRAZE, and that is the honest claim rather than
+         * "it never touches". Clearing a Buggy parked SIDEWAYS wants
+         * reach + reach + a wheel = 0.670 m of lateral room and the Hummer's
+         * whole offset budget is 0.661, so the geometry does not permit a clean
+         * pass here -- the car goes as wide as it is allowed and brushes. See
+         * ai.h, "the steering decision", on the budget. */
+        ck(worst_ov_on < worst_ov_off * 0.5f && bang_on < bang_off,
+           "  and the one that steers turns it into a graze -- %.3f m of overlap"
+           " against %.3f, %.2f m/s against %.2f",
+           worst_ov_on, worst_ov_off, bang_on, bang_off);
+        ck(near_on > near_off,
+           "  it passes WIDER than the twin does rather than steering into it"
+           " -- %.3f m at the closest against %.3f", near_on, near_off);
+        ck(widest > 0.05f && widest <= h.car[0].bump_limit,
+           "  it moved a real distance across and stayed inside its own budget"
+           " (%.3f m of %.3f)", widest, h.car[0].bump_limit);
+        /* A car that slides sideways with its nose straight ahead is the tell
+           that this is an offset and not a driver. */
+        ck(yaw_peak > 0.02f,
+           "  and it POINTS into the move rather than sliding flat"
+           " (%.1f degrees of heading held)", yaw_peak * 57.29577951f);
+        ck(flips == 0,
+           "  it commits to one side rather than weaving (%d changes of side)",
+           flips);
+        ck(replay_diff == 0,
+           "  and the replay behind it is BIT-IDENTICAL to the twin's --"
+           " cursor, u, lap, distance, both speeds and the coefficient"
+           " (%d divergent car-ticks)", replay_diff);
+        ai_free(&h);
+        ai_free(&ref);
+        col_free(&col);
+    }
+
+    /* ---- 3. THE FIELD, ON ALL TEN, WITH AND WITHOUT.
+     *
+     * The headline: does deciding actually reduce contact between opponents, or
+     * does it just move them about? A minute on each track, no player, twice.
+     */
+    {
+        int t, tracks_on = 0, tracks_off = 0;
+        float ov_on = 0.0f, ov_off = 0.0f;
+
+        for (t = 0; t < AI_N_RACES; t++) {
+            int pass;
+            for (pass = 0; pass < 2; pass++) {
+                ai_t f;
+                char path[128];
+                int c, d, touched = 0;
+                float far3[3], worst = 0.0f;
+
+                snprintf(path, sizeof(path), ASSETS "/%s.col",
+                         AI_RACES[t].track);
+                memset(&col, 0, sizeof(col));
+                if (!col_load(path, &col))
+                    continue;
+                memset(&f, 0, sizeof(f));
+                if (ai_init(&f, t, ASSETS, col_rb_world(&col), 1, 0) < 1) {
+                    col_free(&col);
+                    continue;
+                }
+                f.steer_off = pass;      /* 0 decides, 1 does not */
+                far3[0] = f.car[0].rb.body.x[0] + 1000.0f;
+                far3[1] = f.car[0].rb.body.x[1];
+                far3[2] = f.car[0].rb.body.x[2] + 1000.0f;
+                for (i = 0; i < 60 * 60; i++) {
+                    ai_step(&f, NULL, far3[0], far3[1], far3[2], 0,
+                            1.0f / 60.0f);
+                    for (c = 0; c < f.n; c++)
+                        for (d = c + 1; d < f.n; d++) {
+                            float ov = proxy_overlap(&f.car[c].rb,
+                                                     &f.car[d].rb);
+                            if (ov > 0.0f)
+                                touched = 1;
+                            if (ov > worst)
+                                worst = ov;
+                        }
+                }
+                if (pass == 0) {
+                    if (touched) tracks_on++;
+                    if (worst > ov_on) ov_on = worst;
+                } else {
+                    if (touched) tracks_off++;
+                    if (worst > ov_off) ov_off = worst;
+                }
+                ai_free(&f);
+                col_free(&col);
+            }
+        }
+        printf("       ten tracks, a minute each, no player: %d tracks touch"
+               " deciding against %d not, worst overlap %.3f m against %.3f\n",
+               tracks_on, tracks_off, ov_on, ov_off);
+        ck(tracks_on <= tracks_off && ov_on <= ov_off,
+           "the field touches itself less when it can see the other cars"
+           " (%d/%d tracks, %.3f/%.3f m)", tracks_on, tracks_off, ov_on,
+           ov_off);
     }
 }
 
@@ -2206,6 +2579,7 @@ int main(int argc, char **argv)
     part7();
     part8();
     part9();
+    part10();
     printf("\n%d passed, %d failed\n", pass, fail);
     return fail ? 1 : 0;
 }

@@ -721,16 +721,32 @@ int main(void)
             buf = malloc((size_t)sz);
             if (buf && fread(buf, 1, (size_t)sz, f) == (size_t)sz) {
                 /* Lop off the tail back into the middle of the materials.
-                   The tail is [surf ntris][water ncell*4][eng_surf ntris], so
-                   every array behind `surf` has to be counted here -- this used
-                   to stop at the water layer, and when COL4 appended eng_surf
-                   the cut stopped short of `surf` entirely and left it intact.
-                   The fixture no longer reached the state it was written for,
-                   which is exactly what it then reported. */
-                long cut = (long)(36319 + 36319 / 2);
-                FILE *o = fopen("/tmp/wetcheck_trunc.col", "wb");
+                   The tail is [surf ntris][water ncell*4][eng_surf ntris]
+                   [light ntris], so every array behind `surf` has to be counted
+                   here -- and it is READ OFF THE HEADER rather than written down,
+                   because it has now gone stale twice: once when COL4 appended
+                   eng_surf and again when COL5 appended `light`, and both times
+                   the cut stopped short of `surf` entirely, left it intact, and
+                   the fixture reported that the code had stopped dropping it.
+                   A fixture with the file's own dimensions in it cannot go stale
+                   the third time. */
+                const unsigned int nx = *(const unsigned int *)(buf + 16);
+                const unsigned int nz = *(const unsigned int *)(buf + 20);
+                const unsigned int nt = *(const unsigned int *)(buf + 24);
+                const int v5 = memcmp(buf, "COL5", 4) == 0;
+                const int v4 = v5 || memcmp(buf, "COL4", 4) == 0;
+                const int v3 = v4 || memcmp(buf, "COL3", 4) == 0;
+                long tail = 0;
+                FILE *o;
+                if (v5) tail += (long)nt;                  /* light    */
+                if (v4) tail += (long)nt;                  /* eng_surf */
+                if (v3) tail += (long)nx * nz * 4;         /* water    */
+                tail += (long)nt + (long)nt / 2;           /* into `surf` */
+                printf("  %.4s, %u tris, %u x %u cells -> cutting %ld bytes\n",
+                       (const char *)buf, nt, nx, nz, tail);
+                o = fopen("/tmp/wetcheck_trunc.col", "wb");
                 if (o) {
-                    fwrite(buf, 1, (size_t)(sz - 1708 * 4 - cut), o);
+                    fwrite(buf, 1, (size_t)(sz - tail), o);
                     fclose(o);
                 }
                 if (col_load("/tmp/wetcheck_trunc.col", &col)) {
@@ -739,11 +755,15 @@ int main(void)
                            col.ntris, col.surf ? "PRESENT" : "absent",
                            col.water_y ? "PRESENT" : "absent",
                            col.eng_surf ? "PRESENT" : "absent");
+                    printf("             lightmap %s\n",
+                           col.light ? "PRESENT" : "absent");
                     ck(col.surf == NULL, "a short material array is dropped");
                     ck(col.water_y == NULL,
                        "and the water behind it is dropped with it");
                     ck(col.eng_surf == NULL,
                        "and so is the engine surface class behind that");
+                    ck(col.light == NULL,
+                       "and COL5's lightmap byte, which is behind that again");
                     ck(col.ntris > 1000, "while the collision triangles survive");
                     col_free(&col);
                 } else {

@@ -36,13 +36,44 @@ Layout (little-endian):
                                      marks key their strength on. Kept separate
                                      from `surf`, which drives audio and is a
                                      keyword guess at the same idea.
+    u8[ntris] light                  COL5: how bright the LEVEL'S OWN LIGHTMAP
+                                     is on this triangle, 0..254, and 255 for
+                                     "no lightmap on this face". See LIGHTMAP
+                                     below -- this is what darkens the car under
+                                     a bridge.
 
 COL1 is the same file without `default_surf` and the trailing `surf` array;
 COL2 is the same file without `water_y`; COL3 is the same file without
-`eng_surf`. col.c still loads all of them -- a COL1 grid reports SURF_DEFAULT
-everywhere, a COL1 or COL2 grid reports no water anywhere, and a pre-COL4 grid
-reports engine class 0 everywhere, which puts the tyre marks back on the flat
-strength they had before and costs nothing else.
+`eng_surf`; COL4 is the same file without `light`. col.c still loads all of them
+-- a COL1 grid reports SURF_DEFAULT everywhere, a COL1 or COL2 grid reports no
+water anywhere, a pre-COL4 grid reports engine class 0 everywhere (which puts the
+tyre marks back on the flat strength they had before), and a pre-COL5 grid
+reports no lightmap anywhere, which leaves the car's own light at 1.0 and is
+exactly how it looked before this existed.
+
+LIGHTMAP
+--------
+The engine collides against its RENDER geometry, so the face under a wheel
+carries its own LM UVs and `FUN_004572c0' can sample the atlas at the contact
+point -- the mean of the texel's R, G and B -- which is what FUN_00531ff0
+averages over the four wheels to darken the car (see carlight.h). This port's
+collision is a separate grid, so the answer is baked here instead: per collision
+triangle, the atlas sampled at the CENTROID of its three lightmap UVs.
+
+Three things about that:
+
+  * the atlases are the `0x8232' blobs embedded in the .sb, and their header's
+    data offset is not usable -- pixels start straight after the 160-byte header.
+    Same trap and same fix as pack_vsc.load_texture_data, whose comment has the
+    two ways it bit
+  * v is taken DOWN the image, which is the row order scene.c uploads and
+    therefore the row GL samples at that v. Sampling it the other way up would
+    read a plausible-looking brightness off the wrong end of the atlas
+  * one value per triangle rather than one per contact point. A 512x512 atlas
+    over a whole track is metres per texel, so the interpolation the engine does
+    inside a face is finer than the data underneath it -- and the curve that
+    consumes this (light_car.bspl) is FLAT outside 113..201 of 255, so most of
+    the difference cannot survive it anyway
 
 WATER
 -----
@@ -150,6 +181,7 @@ import os
 import re
 import struct
 
+import csi2png
 import pack_vsc
 from gen_vis_data import wsurf_section, wsurf_values
 import sb2obj
@@ -287,6 +319,62 @@ def eng_surface_class(words):
     if v & 0x100:
         return 6
     return 9 if (v & 0x200) else 0
+
+
+LIGHT_NONE = 255            # col.h's COL_LIGHT_NONE: this face has no lightmap
+
+
+def lightmap_atlas(b, textures, name, cache):
+    """Decode one embedded lightmap atlas to (w, h, rgba). None if there is
+    nothing to decode.
+
+    The data offset in the .csi header is an offset into whatever the image was
+    cut out of and is wrong on an embedded blob -- 0 on beach_1 and 1032 on
+    beach_4, and the pixels start straight after the 160-byte header in both.
+    pack_vsc.load_texture_data carries the same guard and the story of both ways
+    it bit; this one only ever needs level 0.
+    """
+    if name in cache:
+        return cache[name]
+    cache[name] = None
+    blob = textures.get(name, {}).get("embedded")
+    if not blob:
+        return None
+    d = b[blob[0]:blob[1]]
+    try:
+        h = csi2png.parse_header(d)
+    except Exception:
+        return None
+    need = h.width * h.height * h.bpp
+    off = h.data_off
+    if off < csi2png.HDR_SIZE or off + need > len(d):
+        off = csi2png.HDR_SIZE
+    if off + need > len(d):
+        return None
+    cache[name] = (h.width, h.height,
+                   csi2png.decode_level(d, off, h.width, h.height, h))
+    return cache[name]
+
+
+def lightmap_at(atlas, u, v):
+    """The mean of the texel's R, G and B at (u, v), 0..254, or LIGHT_NONE.
+
+    FUN_004572c0's own last line is `(r + g + b) * 0.33333334', so this is the
+    same quantity. v runs DOWN the image, matching the row order scene.c uploads
+    and therefore what GL samples at that v. Wrapped rather than clamped: the
+    lightmap UVs are inside 0..1 on the shipped tracks, and a wrap is what the
+    sampler above it would do with one that was not.
+    """
+    if not atlas:
+        return LIGHT_NONE
+    w, h, rgba = atlas
+    x = int(u * w) % w
+    y = int(v * h) % h
+    o = (y * w + x) * 4
+    m = (rgba[o] + rgba[o + 1] + rgba[o + 2]) // 3
+    # 254 is the top: 255 is the "no lightmap" sentinel, and the curve that reads
+    # this saturates at 201 of 255 anyway, so nothing measurable is lost.
+    return m if m < LIGHT_NONE else LIGHT_NONE - 1
 
 
 def tri_up_area(t):
@@ -441,6 +529,8 @@ def main():
     tris = []
     surf = []                             # parallel to tris; None = unmatched
     esurf = []                            # parallel to tris; the ENGINE's class
+    light = []                            # parallel to tris; COL5, the lightmap
+    lm_cache = {}                         # atlas name -> (w, h, rgba)
     wtris = []                            # the water surfaces, for their height
     wsea = []                             # ... and whether each is a `sea` face
     dropped_tex = dropped_name = dropped_vertical = dropped_flat = 0
@@ -510,7 +600,7 @@ def main():
         # a transition face's SECOND texture is deliberately ignored here: the
         # engine's surface class already comes from COL4 and the blend is a
         # rendering fact, not a driving one.
-        for (vidx, _uvidx, tname, _lmidx, _lmname,
+        for (vidx, _uvidx, tname, lmidx, lmname,
              _uv2, _tname2, _aidx, _aname) in faces:
             if max(vidx) >= len(vs):
                 continue
@@ -541,6 +631,19 @@ def main():
             tris.append(tri)
             surf.append(classify(tname))
             esurf.append(eng_of.get(tname, 0))
+            # COL5: the lightmap on this face, at the centroid of its own three
+            # lightmap UVs. A face with no lightmap layer -- 46% of beach_1's,
+            # and every prop, water and sky face -- carries the sentinel, and
+            # col_light_at then has no opinion about it, which is exactly what
+            # FUN_004572c0 answers when it cannot find a texel.
+            lv = LIGHT_NONE
+            if lmname and lmidx and max(lmidx) < len(uv):
+                atlas = lightmap_atlas(b, textures, lmname, lm_cache)
+                if atlas:
+                    cu = sum(uv[i][0] for i in lmidx) / 3.0
+                    cv = sum(uv[i][1] for i in lmidx) / 3.0
+                    lv = lightmap_at(atlas, cu, cv)
+            light.append(lv)
 
     if not tris:
         raise SystemExit("no collision triangles")
@@ -669,7 +772,7 @@ def main():
                     water[row + cx] = ty
 
     with open(a.out, "wb") as f:
-        f.write(b"COL4")
+        f.write(b"COL5")
         f.write(struct.pack("<fffII", min_x, min_z, cell, nx, nz))
         f.write(struct.pack("<I", len(tris)))
         f.write(struct.pack("<I", default_surf))
@@ -684,6 +787,9 @@ def main():
         # (26% agreement over the 319 in these tracks). Two bytes a triangle is
         # 40-50 KB a track.
         f.write(bytes(esurf))
+        # COL5. One more byte a triangle, and the whole of the car's own
+        # "darker under the bridge" -- see LIGHTMAP above and carlight.h.
+        f.write(bytes(light))
 
     occupied = sum(1 for x in buckets if x)
     n_wet = sum(1 for w in water if w != NO_WATER)
@@ -701,6 +807,25 @@ def main():
     print(f"  surfaces default={SURF_NAMES[default_surf]}  "
           f"unmatched {n_unmatched:,} ({100.0*n_unmatched/len(tris):.1f}% -> default)")
     print("    " + "  ".join(f"{k} {v:,}" for k, v in mix.most_common()))
+    lit = [v for v in light if v != LIGHT_NONE]
+    if lit:
+        lit_sorted = sorted(lit)
+        print(f"  lightmap {len(lit):,} of {len(light):,} tris carry one "
+              f"({100.0*len(lit)/len(light):.1f}%), brightness "
+              f"min {lit_sorted[0]}  median {lit_sorted[len(lit)//2]}  "
+              f"max {lit_sorted[-1]}")
+        # The two ends of light_car.bspl, because THEY are what the numbers above
+        # have to straddle for the feature to do anything: a track whose lit
+        # triangles are all over 201 can never darken a car, and one whose
+        # triangles are all under 113 would hold it dark everywhere.
+        dark = sum(1 for v in lit if v <= 112)
+        brite = sum(1 for v in lit if v >= 201)
+        print(f"    below the curve's floor (<=112) {dark:,} "
+              f"({100.0*dark/len(lit):.1f}%)   above its ceiling (>=201) "
+              f"{brite:,} ({100.0*brite/len(lit):.1f}%)")
+    else:
+        print(f"  lightmap NONE of {len(light):,} tris carry one -- the car's "
+              f"own light will sit at 1.0 on this track")
     emix = collections.Counter(ENG_SURF_NAMES[e] for e in esurf)
     print(f"  engine   {sum(1 for e in esurf if e):,} of {len(esurf):,} tris classified"
           f" ({100.0*sum(1 for e in esurf if e)/len(esurf):.1f}%)")

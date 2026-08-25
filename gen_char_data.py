@@ -377,6 +377,235 @@ GROUPS = [
       "TowerShootT"]),
 ]
 
+# ---------------------------------------------------------------------------
+# BURST_MNG -- the gunfire, and its loader is a DIFFERENT GETTER.
+#
+# The guard shoots by spawning a 'BRMN' object (0x51aa81 pushes the 4CC), and
+# every constant that object runs on comes out of Settings/burst_mng.ini through
+# the FLOAT getter at 0x532410, whose fifth argument is a DIVISOR -- value is
+# raw / div, not raw * scale -- so read_conversion's cfgGetInt-then-fmul pattern
+# cannot see any of them. The call shape is fixed and regular:
+#
+#     push <div:f32> ; push 1 ; push <key> ; push "BURST_MNG" ; push obj ; call
+#
+# so the divisor's own push sits exactly 7 bytes before the key's, and the
+# destination global is the `fstp ds:` (or `mov ds:,eax` for the int) that
+# follows the call. Read that way rather than transcribed, so a wrong address
+# reads a wrong number instead of agreeing with a comment.
+BURST_SECTION = "BURST_MNG"
+BURST_GETTER = 0x532410
+BURST_KEYS = ["NShoots", "TimeShoot", "Offset", "Radius", "CollisionLen"]
+
+
+def read_burst(img):
+    """-> {key: (value, raw, div, site_va, dest_va, from_crs)}"""
+    raws = shipped("burst_mng.ini", "burst_mng.crs")
+    sect = set(img.strings(BURST_SECTION))
+    out = {}
+    for k in BURST_KEYS:
+        if k not in raws:
+            out[k] = None
+            continue
+        raw, from_crs = raws[k]
+        got = None
+        for sva in img.strings(k):
+            for site in img.pushes(sva):
+                o = img.off(site)
+                if o is None or o < 7:
+                    continue
+                d = img.d
+                # push <section> must follow the key's own push, or this is one
+                # of the four other config files that also have a `Radius`.
+                if d[o + 5] != 0x68:
+                    continue
+                if struct.unpack_from("<I", d, o + 6)[0] not in sect:
+                    continue
+                if d[o - 7] != 0x68 or d[o - 2] != 0x6A:
+                    continue
+                div = struct.unpack_from("<f", d, o - 6)[0]
+                dest = None
+                for j in range(o + 12, o + 40):
+                    if d[j] == 0xD9 and d[j + 1] == 0x1D:      # fstp ds:
+                        dest = struct.unpack_from("<I", d, j + 2)[0]
+                        break
+                    if d[j] == 0xA3:                            # mov ds:,eax
+                        dest = struct.unpack_from("<I", d, j + 1)[0]
+                        break
+                if div:
+                    got = (raw / div, raw, div, site, dest, from_crs)
+                break
+            if got:
+                break
+        out[k] = got
+    return out
+
+
+# ---------------------------------------------------------------------------
+# THE ATTENTION MACHINE -- one shared watcher, four creatures, and its numbers
+# are ARGUMENTS rather than config.
+#
+# 0x535720 allocates a watcher over two volumes and 0x5357e0 steps it, returning
+# 0 nothing / 1 dropped / 2 tracking / 3 ATTACK. The two delays and the attack
+# count are pushed as immediates at each creation site, so there is no key name
+# to grep for and no .ini to read: the site is the record.
+#
+#     param_3  the dwell before the FIRST attack        (w[0x33])
+#     param_4  the dwell between later ones            (w[0x34])
+#     param_6  how many attacks before it drops the target and re-acquires
+#
+# param_7 (the guard's 45.0) is stored at w[0x61] and nothing in the four
+# watcher functions reads it -- searched by scanning .text for every dword in
+# w's own range, the same way the guard's four dead .ini keys were found.
+WATCHERS = [
+    ("guard", 0x51A670, "Guard_Man: visibilityVolume + guardVolume"),
+    ("tower", 0x517F10, "the Btr's tower, roadcar.ini's Tower* keys"),
+    ("dog", 0x518B80, "the Dog: attackVolume"),
+    ("seagull", 0x513B40, "the Seagull, whose ground machine does not use it"),
+]
+
+
+def read_watcher(img, site, window=0x180):
+    """The (first delay, repeat delay, max attacks) pushed at a 0x535720 call.
+
+    Walks forward from the function entry collecting `push imm32` / `push imm8`
+    in order and stops at the first call to 0x535720; the argument list is that
+    run reversed, and cdecl puts param_1 last. Only the shape matters -- three
+    of the seven arguments are stack pointers this does not have to resolve."""
+    d, o = img.d, img.off(site)
+    if o is None:
+        return None
+    pushes = []
+    for j in range(o, o + window):
+        if d[j] == 0xE8:
+            tgt = img.va(j) + 5 + struct.unpack_from("<i", d, j + 1)[0]
+            if tgt == 0x535720:
+                args = list(reversed(pushes))
+                if len(args) < 4:
+                    return None
+                # args[0] is param_1 only when every argument was an immediate;
+                # here the pointers are pushed from registers and do not appear,
+                # so the immediates arrive in argument order: delay1, delay2,
+                # count, and (the guard only) the unread param_7.
+                f1 = struct.unpack("<f", struct.pack("<I", args[0]))[0]
+                f2 = struct.unpack("<f", struct.pack("<I", args[1]))[0]
+                return (f1, f2, args[2])
+            continue
+        if d[j] == 0x68:
+            pushes.append(struct.unpack_from("<I", d, j + 1)[0])
+        elif d[j] == 0x6A:
+            pushes.append(d[j + 1])
+    return None
+
+
+# ---------------------------------------------------------------------------
+# THE REACTION -- what a person DOES about a car, and every threshold in it is
+# an immediate in .text rather than a key in a config file.
+#
+# The whole feature was in the shipped data and these notes said the characters
+# only react to being run over: people.sb gives every person a `Pendal` (a KICK)
+# and a `Brosok` (a THROW) clip, the exe's own clip table at 0x573c68 is
+# [Stand, Walk, Brosok, Pendal, Hurt] in animation-state order, and 0x510f40 is
+# the decision. There is no slider for any of it, so each constant is emitted
+# here as the FLOAT AT THE ADDRESS THE INSTRUCTION READS, with the instruction's
+# own address beside it: a wrong site emits a wrong number instead of quietly
+# agreeing with a comment, which is the rule the physics loaders already follow.
+#
+# (macro, .data address of the float, the instruction that reads it, note)
+REACT = [
+    ("CHR_REACT_DY",        0x554688, 0x510F89,
+     "the car has to be within this much of the person's own height"),
+    ("CHR_REACT_NEAR",      0x5544A0, 0x511098,
+     "inside this it always reacts, whichever way it is facing"),
+    ("CHR_REACT_THROW_P",   0x5544F0, 0x5110DA,
+     "rand01 at or under this tries the THROW; above it, the kick"),
+    ("CHR_REACT_CONE",      0x5547BC, 0x511163,
+     "degrees off the person's forward, for the running kick"),
+    ("CHR_REACT_FAR",       0x5543F0, 0x511174,
+     "and how far away that one reaches"),
+    ("CHR_REACT_CAR_SPEED", 0x554B08, 0x5111B0,
+     "and how fast the car has to be coming -- 15.0 km/h exactly"),
+    ("CHR_REACT_TURN_RATE", 0x000000, 0x5114CD,
+     "degrees a second onto the car, pushed as an immediate"),
+    ("CHR_REACT_WINDUP",    0x554384, 0x5114F9,
+     "seconds facing the car before the swing starts"),
+    ("CHR_REACT_KICK_LOST", 0x554518, 0x511555,
+     "the car got away: abandon the kick past this"),
+    ("CHR_REACT_KICK_T0",   0x554AAC, 0x5115C4,
+     "seconds into the 3.0 s Pendal clip when the sole connects"),
+    ("CHR_REACT_GRAB_LOST", 0x554B0C, 0x511290,
+     "the same for the throw, which reaches further"),
+    ("CHR_REACT_GRAB_T0",   0x554688, 0x5112EB,
+     "seconds into the 4.7 s Brosok clip when the car leaves the ground"),
+    ("CHR_REACT_LET_GO_T",  0x5543C8, 0x510DD7,
+     "and when it leaves the hand"),
+    ("CHR_REACT_LIFT_UP",   0x554B04, 0x510EC3,
+     "how far above the person the clearance sphere sits"),
+    ("CHR_REACT_KICK_AWAY", 0x5543F0, 0x51160E,
+     "m/s away from the person, horizontally"),
+    ("CHR_REACT_KICK_UP",   0x5547E4, 0x511605,
+     "and m/s straight up -- the kick pops the car"),
+    ("CHR_REACT_THROW_FWD", 0x5547E4, 0x510DFE,
+     "m/s along the person's forward, past the car's own 6.91 top speed"),
+    ("CHR_REACT_THROW_UP",  0x5543F0, 0x510E0A,
+     "and m/s up -- the throw is the flatter of the two"),
+    ("CHR_BULLET_AWAY",     0x000000, 0x5085C8,
+     "a round that lands: m/s away from where it hit"),
+    ("CHR_BULLET_UP",       0x000000, 0x5085C3,
+     "and m/s up"),
+    ("CHR_BULLET_LEAD",     0x554384, 0x52DC8E,
+     "Offset is scaled by this and the target's speed IN KM/H, to lead it"),
+    ("CHR_BULLET_REACH",    0x554824, 0x52DD0E,
+     "the ray runs this many times the distance to the aim point"),
+    ("CHR_BULLET_MIN",      0x554490, 0x52DD14,
+     "or this far, whichever is longer"),
+    ("CHR_GULL_STARTLE",    0x000000, 0x512D0E,
+     "a car, a person or a dog inside this and the gull goes up"),
+    ("CHR_GULL_ARRIVE",     0x000000, 0x512CE2,
+     "and how near its wander target counts as arrived"),
+    ("CHR_GUARD_MUZZLE",    0x554824, 0x51AA6C,
+     "the burst is spawned this far above the guard's own pivot"),
+]
+
+# The immediates above that are PUSHED rather than loaded from .data: the value
+# is the push's own operand, so the address column is the instruction and there
+# is no separate float to read.
+REACT_PUSHED = {
+    0x5114CD: 4, 0x51160E: 4, 0x511605: 4,
+    0x5085C8: 4, 0x5085C3: 4, 0x512D0E: 4,
+}
+
+# And one is neither: MSVC stores a float straight into the object with
+# `mov dword ptr [reg+disp32], imm32`, so the operand is six bytes in.
+REACT_STORED = {0x512CE2: 6}
+
+
+def read_react(img):
+    """-> [(macro, value, data_va, site_va, note)]
+
+    A .data entry is read at its address; a pushed one is read out of the
+    instruction itself, which is why REACT_PUSHED exists -- MSVC emits a float
+    argument as `push imm32` and there is no constant pool entry to point at."""
+    out = []
+    for macro, dva, site, note in REACT:
+        if site in REACT_STORED:
+            o = img.off(site)
+            v = (None if o is None
+                 else struct.unpack_from("<f", img.d, o + REACT_STORED[site])[0])
+            out.append((macro, v, 0, site, note))
+            continue
+        if site in REACT_PUSHED:
+            o = img.off(site)
+            if o is None or img.d[o] != 0x68:
+                out.append((macro, None, dva, site, note))
+                continue
+            v = struct.unpack_from("<f", img.d, o + 1)[0]
+            out.append((macro, v, 0, site, note))
+            continue
+        v = img.f32(dva)
+        out.append((macro, v, dva, site, note))
+    return out
+
+
 # The one key whose loader is a clamped remap rather than a multiply, and the
 # three immediates it uses. Written out with its address so a mutant has to
 # break two copies -- the same rule the harnesses follow for a recovered value.
@@ -605,7 +834,7 @@ def fl(v):
     return s + "f"
 
 
-def emit(f, consts, placements):
+def emit(f, consts, placements, burst, watch, react):
     f.write("""/*
  * char_data.h -- the 59 people, animals and road cars the tracks place, and
  * every behaviour constant the engine loads for them.
@@ -641,6 +870,109 @@ def emit(f, consts, placements):
                     % (grp.upper(), k.upper(), fl(val), raw,
                        "crs" if from_crs else "ini", how))
         f.write("\n")
+
+    # --------------------------------------------------- the burst manager ---
+    f.write("""/*
+ * BURST_MNG -- the gunfire. burst_mng.ini + burst_mng.crs, read through the
+ * FLOAT getter at 0x532410 (value = raw / div, and it does NOT clamp), so
+ * `Radius` ships at 200 against its own .ini range of 0..100 and means 2.0 m.
+ *
+ * A guard whose watcher says ATTACK spawns a 'BRMN' object at 0x51aa81, one
+ * metre and a half above its own pivot, and that object fires NShoots rounds
+ * TimeShoot apart. Each round is a ray from the muzzle to the target car's
+ * position led by `Offset` x its speed IN KM/H x 0.5, plus a sweep that walks
+ * from +Radius to -Radius along one random unit vector across the burst -- so a
+ * burst sprays and only the middle of it is on the car.
+ */
+""")
+    for k in BURST_KEYS:
+        v = burst.get(k)
+        if not v:
+            f.write("/* %-16s UNRESOLVED */\n" % k)
+            continue
+        val, raw, div, site, dest, from_crs = v
+        f.write("#define CHR_BURST_%-14s %-14s /* raw %d %s, / %g at 0x%06x -> 0x%06x */\n"
+                % (k.upper(), fl(val), raw, "crs" if from_crs else "ini",
+                   div, site, dest or 0))
+    f.write("""
+/* The whole burst lasts (NShoots - 1) * TimeShoot, derived at 0x52dff0. */
+#define CHR_BURST_LEN            %s
+
+/* AND `CollisionLen` IS A DEAD KEY. 0x52dfd4 stores it at 0x165be58 and nothing
+ * in the image reads that dword -- searched by scanning every dword in .text
+ * inside 0x165be3c..0x165be60, which finds all six of its neighbours' readers.
+ * The ray's own length is 1.5x the distance to the aim point or 10 m, whichever
+ * is longer, and both of those are immediates in 0x52dc50. Same shape as the
+ * guard's four .ini keys below: shipped, converted, and never consumed.
+ */
+
+""" % fl((burst["NShoots"][0] - 1) * burst["TimeShoot"][0]
+         if burst.get("NShoots") and burst.get("TimeShoot") else 0.0))
+
+    # ------------------------------------------------ the attention machine ---
+    f.write("""/*
+ * THE ATTENTION MACHINE -- 0x535720 builds it, 0x5357e0 steps it, and four
+ * creatures share it. It holds a target, two volumes and a dwell clock:
+ *
+ *   nothing is in the ACQUIRE volume            -> 0, the creature is idle
+ *   the target has left the HOLD volume         -> 1, dropped
+ *   the dwell has not run out yet               -> 2, tracking (turn to face)
+ *   it has                                      -> 3, ATTACK
+ *
+ * Acquire takes the NEAREST '$CAR' in the acquire volume with the distance of
+ * the last car it attacked DOUBLED, so it works round a field rather than
+ * fixating. `first` is the dwell before the first attack and `again` the dwell
+ * between later ones; after `count` attacks it drops the target and re-acquires.
+ * Every one of those is an immediate at the creation site, quoted per row.
+ */
+typedef struct {
+    float first, again;
+    int   count;
+} chr_watch_t;
+
+""")
+    for name, site, note in WATCHERS:
+        w = watch.get(name)
+        if not w:
+            f.write("/* %-8s UNRESOLVED */\n" % name)
+            continue
+        f.write("#define CHR_WATCH_%-10s { %-14s %-14s %d } /* 0x%06x -- %s */\n"
+                % (name.upper(), fl(w[0]) + ",", fl(w[1]) + ",", w[2], site, note))
+    f.write("\n")
+
+    # ------------------------------------------------------- the reaction ---
+    f.write("""/*
+ * THE REACTION -- a person KICKS a car, or picks it up and THROWS it, and a
+ * guard shoots at it. All of it was in the shipped data while these notes said
+ * the layer only noticed being run over: people.sb gives the Man, the Woman and
+ * the RepairMan a `Pendal` (Russian for a kick) and a `Brosok` (a throw), the
+ * Guard a `kick` and a `shoot`, and the exe's own clip tables put them in
+ * animation-state order --
+ *
+ *   people  0x573c68  [ Stand, Walk, Brosok, Pendal, Hurt ]
+ *   guard   0x574bec  [ kick, shoot, stand ]
+ *   seagull 0x573e84  [ start_flight, flight_idle, look_around, walk, flight ]
+ *
+ * -- selected from a flag word by 0x50f780 (0x100 throw, 0x20 kick, 0x10 hurt,
+ * 0x3 walk, else stand), 0x51ae10 (0x10 kick, 0x20 shoot, else stand) and
+ * 0x5137c0 (1 look_around, 2 walk, 4 flight, else start_flight). The decision
+ * itself is 0x510f40, the kick 0x511470, the grab 0x5111f0 and the carry and
+ * release 0x510b90.
+ *
+ * None of it is sliderable, so every threshold below is emitted as the float at
+ * the address the instruction reads, with the instruction beside it -- a wrong
+ * site emits a wrong number rather than agreeing with a comment.
+ */
+""")
+    for macro, val, dva, site, note in react:
+        if val is None:
+            f.write("/* %-22s UNRESOLVED at 0x%06x */\n" % (macro, site))
+            continue
+        where = ("imm at 0x%06x" % site if not dva
+                 else "0x%06x read at 0x%06x" % (dva, site))
+        f.write("#define %-22s %-14s /* %s\n%*s   %s */\n"
+                % (macro, fl(val), where, 24, "", note))
+    f.write("\n")
 
     # ------------------------------------------------ the collision proxy ---
     f.write("""/*
@@ -878,6 +1210,9 @@ def main():
 
     img = Image(EXE)
     consts = resolve_constants(img)
+    burst = read_burst(img)
+    watch = {n: read_watcher(img, site) for n, site, _ in WATCHERS}
+    react = read_react(img)
     placements = {t: read_placements(t) for t in TRACKS}
 
     if a.check or not a.out:
@@ -893,6 +1228,21 @@ def main():
                       % (k, val, raw, "crs" if fc else "ini",
                          "clamped remap" if ops is None else
                          "%s -> %s" % (ops_formula(ops), hex(dest))))
+        print("== burst_mng (BURST_MNG, the float getter at 0x532410)")
+        for k in BURST_KEYS:
+            v = burst.get(k)
+            print("   %-16s %s" % (k, "UNRESOLVED" if not v else
+                  "= %-10g raw %-5d %-4s / %g at %s -> %s"
+                  % (v[0], v[1], "crs" if v[5] else "ini", v[2], hex(v[3]),
+                     hex(v[4] or 0))))
+        print("== watchers (0x535720)")
+        for nm, site, note in WATCHERS:
+            print("   %-8s %-24s %s" % (nm, watch.get(nm), note))
+        print("== the reaction (immediates)")
+        for macro, val, dva, site, note in react:
+            print("   %-22s %-12s %s @ %s"
+                  % (macro, "UNRESOLVED" if val is None else "%g" % val,
+                     hex(dva), hex(site)))
         n = 0
         for t in TRACKS:
             rows = placements[t]
@@ -910,7 +1260,7 @@ def main():
             return
 
     with open(a.out, "w") as f:
-        emit(f, consts, placements)
+        emit(f, consts, placements, burst, watch, react)
     print("wrote %s" % a.out)
 
 

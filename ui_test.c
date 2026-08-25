@@ -331,6 +331,31 @@ static void project(const float m[16], float x, float y, float out[2])
     out[1] = m[1]*x + m[5]*y + m[13];
 }
 
+/* WHICH SIDE OF THE SCREEN A WORLD BEARING FALLS ON, built out of the real view
+ * transform rather than reasoned about -- assuming it is what had the direction
+ * arrow mirrored, and deriving it on paper is what had the minimap arrow
+ * mirrored before that (traps.md).
+ *
+ * main.c lays the view down as glRotatef(vpitch, X), glRotatef(-vyaw, Y),
+ * glTranslatef(-eye), which in GL's column-vector terms is Rx(vpitch).Ry(-vyaw)
+ * and puts eye-space x on ROW 0 of that product, (cos(-vyaw), 0, sin(-vyaw)) --
+ * Rx does not touch x, so the pitch drops out. NDC x is eye_x / -eye_z and no
+ * viewport flips x, so the SIGN of eye_x is the sign of screen x about the
+ * centre. The chase camera's vyaw is the car's VIEW yaw, which is the rig yaw
+ * `dirarrow_in' carries minus 180 (main.c adds the 180 the other way), and its
+ * eye sits behind the car along the car's forward.
+ *
+ * Returns eye-space x of the world XZ point: negative is screen LEFT. */
+static float world_eye_x(float rig_yaw_rad, float wx, float wz)
+{
+    const float fx = sinf(rig_yaw_rad), fz = cosf(rig_yaw_rad);  /* car forward */
+    const float vyaw = rig_yaw_rad * 57.29577951f - 180.f;       /* view yaw */
+    const float th = -vyaw * 0.017453292519943295f;              /* Ry(-vyaw) */
+    const float DIST = 8.f;                    /* any pull-back: it is behind */
+    const float ex = -fx * DIST, ez = -fz * DIST;
+    return cosf(th) * (wx - ex) + sinf(th) * (wz - ez);
+}
+
 /* --- hud.c helpers. Draw the pop and measure what came out.
  *
  * With msg_hits bound that is ONE quad, so a bbox and a max alpha describe it
@@ -2773,35 +2798,53 @@ int main(void)
                             "of the real projection");
         }
 
-        /* --- THE SIGN, and it is measured on SCREEN rather than in the angle:
-           a check on the angle would agree with the engine's own unsigned one at
-           every cardinal, and +a and -a agree at 0 and 180. Four bearings and a
-           lopsided one, driven through the slew until it settles. */
+        /* --- THE SIGN, and BOTH SIDES OF IT ARE MEASURED. On screen rather
+           than in the angle, because a check on the angle would agree with the
+           engine's own unsigned one at every cardinal and +a and -a agree at 0
+           and 180 -- and against `world_eye_x', because which screen side a
+           world bearing is on is exactly the half that was taken on paper and
+           came out mirrored: the arrow leaned AWAY from the corner and looked
+           like it was turning with the car. Four bearings and two lopsided ones,
+           two headings so the answer cannot come from x's sign alone, each
+           driven through the slew until it settles. */
         {
-            struct { float ax, az; int want_left; const char *what; } bear[5] = {
-                {  40.f,   0.f, 0, "a target to the RIGHT leans the arrow right" },
-                { -40.f,   0.f, 1, "a target to the LEFT leans it left" },
-                {  17.f,  40.f, 0, "and a lopsided right-hand target too" },
-                { -17.f,  40.f, 1, "and a lopsided left-hand one" },
-                {   0.f,  40.f, 2, "straight ahead stays on the centre line" },
+            struct { float ax, az; const char *what; } bear[5] = {
+                {  40.f,   0.f, "a target 90 degrees off leans the arrow the "
+                                "way the target lies in the view" },
+                { -40.f,   0.f, "and 90 degrees the other way" },
+                {  17.f,  40.f, "a lopsided target too" },
+                { -17.f,  40.f, "and the other lopsided one" },
+                {   0.f,  40.f, "straight ahead stays on the centre line" },
             };
-            int k2;
-            for (k2 = 0; k2 < 5; k2++) {
-                float apex_x, apex_y;
-                int f2;
-                dirarrow_init(&D, &DT);
-                IN.aim_x = bear[k2].ax;
-                IN.aim_z = bear[k2].az;
-                for (f2 = 0; f2 < 600; f2++)
-                    dirarrow_step(&D, &IN, 1.f / 60.f);
-                dirarrow_project(&D, 0, 0.5f, 0.f, SCRW, SCRH, &apex_x, &apex_y);
-                if (bear[k2].want_left == 2)
-                    ck(fabsf(apex_x - vcx) < 0.5f, bear[k2].what);
-                else if (bear[k2].want_left)
-                    ck(apex_x < vcx - 2.f, bear[k2].what);
-                else
-                    ck(apex_x > vcx + 2.f, bear[k2].what);
+            const float yaws[2] = { 0.f, 2.0f };      /* +Z, and 114.6 degrees */
+            int k2, y2;
+            for (y2 = 0; y2 < 2; y2++) {
+                IN.car_yaw = yaws[y2];
+                for (k2 = 0; k2 < 5; k2++) {
+                    float apex_x, apex_y, exq;
+                    int f2;
+                    /* the bearing, ROTATED into this heading's frame, so the
+                       geometry of the case is the same for both */
+                    const float c2 = cosf(IN.car_yaw), s2 = sinf(IN.car_yaw);
+                    const float ax = bear[k2].ax * c2 + bear[k2].az * s2;
+                    const float az = -bear[k2].ax * s2 + bear[k2].az * c2;
+                    dirarrow_init(&D, &DT);
+                    IN.aim_x = ax;
+                    IN.aim_z = az;
+                    for (f2 = 0; f2 < 600; f2++)
+                        dirarrow_step(&D, &IN, 1.f / 60.f);
+                    dirarrow_project(&D, 0, 0.5f, 0.f, SCRW, SCRH,
+                                     &apex_x, &apex_y);
+                    exq = world_eye_x(IN.car_yaw, ax, az);
+                    if (fabsf(exq) < 1e-3f)
+                        ck(fabsf(apex_x - vcx) < 0.5f, bear[k2].what);
+                    else if (exq < 0.f)
+                        ck(apex_x < vcx - 2.f, bear[k2].what);
+                    else
+                        ck(apex_x > vcx + 2.f, bear[k2].what);
+                }
             }
+            IN.car_yaw = 0.f;
             IN.aim_x = 0.f; IN.aim_z = 40.f;
         }
 

@@ -617,6 +617,12 @@ static void fake_car(float speed, float throttle, int contacts, int gear)
     /* identity pose: body +Z is world +Z, so fwd_speed == speed */
     CAR.m[0] = CAR.m[5] = CAR.m[10] = CAR.m[15] = 1.f;
     CAR.in.throttle = throttle;
+    /* The two BUTTON flags rbcar_step derives from the pedals, and they are not
+       decoration: the motor latch reads phys+0x576c / +0x5774 bit 0 and nothing
+       else, so a fixture that sets only the analogue amount leaves the engine
+       switched off. This line is why C1 tests what it says it tests. */
+    CAR.in.accel = (throttle > 0.01f);
+    CAR.in.brake = 0;
     CAR.gear = gear;
     CAR.tune.speed_base_max = 27.f;    /* the Overkill's, km/h */
     for (i = 0; i < 4; i++) CAR.tune.resonator_speed[i] = 1.f;
@@ -636,6 +642,7 @@ static void part_c(void)
 {
     float eye[3] = { 0.f, 0.f, -3.f };
     float idle_loud, fast_loud, air_loud, ground_loud;
+    int i;
 
     printf("\n-- C1 the engine layers --\n");
     if (sfx_init() != 0) {
@@ -651,37 +658,91 @@ static void part_c(void)
     fake_col();
     sfx_set_track(0, &COL);
 
-    /* At rest, no throttle: the car still idles. Asserted by NAME -- the first
-       version of this measured total loudness and passed with the idle layer
-       deleted, because it was hearing the track's ambient bed. */
+    /* THE MOTOR IS A LATCH -- reported as "when race countdown goes, there
+       should not be car engine sound", and the engine's own answer. A car that
+       has just been placed and not yet driven makes NO engine noise: the flag at
+       phys+0xe7c4 is clear and the car_motor callback returns without touching a
+       voice. Asserted by NAME -- the first version of this part measured total
+       loudness and passed with the idle layer deleted, because it was hearing
+       the track's ambient bed. */
     fake_car(0.f, 0.f, 4, 0);
     sfx_update(&CAR, eye, 0.f, 1.f / 60.f);
-    idle_loud = loudness(BLK);
-    ck(voice_playing(audio_mix(), "motor_idle"),
-       "a parked car runs the idle loop");
-    ck(idle_loud > 1.f, "and makes a sound (rms %.0f)", idle_loud);
+    ck(!voice_playing(audio_mix(), "motor_idle")
+       && !voice_playing(audio_mix(), "motor_engine")
+       && !voice_playing(audio_mix(), "motor_accel1"),
+       "a car on the grid that has not been driven has NO engine sound");
 
-    /* The ambient bed the .sb names for this track. beach_1 says noise1. */
+    /* The ambient bed the .sb names for this track. beach_1 says noise1. It is
+       NOT part of the motor and keeps running with the engine off. */
     ck(voice_playing(audio_mix(), "noise1"),
-       "the track's own ambient bed is running (beach_1 -> noise1)");
+       "the track's own ambient bed is running anyway (beach_1 -> noise1)");
 
-    /* Flat out: the running loop takes over from idle. */
+    /* Flat out: the throttle starts the motor, and the running loop takes over
+       from idle. */
     fake_car(7.0f, 1.f, 4, 0);
     sfx_update(&CAR, eye, 0.f, 1.f / 60.f);
     fast_loud = loudness(BLK);
     ck(voice_playing(audio_mix(), "motor_engine"),
-       "flat out runs the engine loop");
+       "the throttle starts it, and flat out runs the engine loop");
     ck(!voice_playing(audio_mix(), "motor_idle"),
        "and the idle layer has faded out entirely");
     ck(voice_playing(audio_mix(), "motor_accel1"),
        "with the accel layer under it (chn.dat's car_motor_2)");
+
+    /* Park it again. Inside the four seconds it keeps idling -- the latch only
+       falls after ENG_OFF_TIME continuously stopped with nothing pressed. */
+    fake_car(0.f, 0.f, 4, 0);
+    for (i = 0; i < 60; i++)                       /* 1.0 s */
+        sfx_update(&CAR, eye, 0.f, 1.f / 60.f);
+    idle_loud = loudness(BLK);
+    ck(voice_playing(audio_mix(), "motor_idle"),
+       "a car that HAS been driven idles while it stands");
+    ck(idle_loud > 1.f, "and makes a sound (rms %.0f)", idle_loud);
     ck(fast_loud > idle_loud,
        "flat out is louder than idle (%.0f vs %.0f)", fast_loud, idle_loud);
 
+    /* ...and four seconds of that switches it off, with the stop transition the
+       bank has always carried and nothing has ever played. */
+    for (i = 0; i < 200; i++)                      /* to 4.33 s */
+        sfx_update(&CAR, eye, 0.f, 1.f / 60.f);
+    ck(!voice_playing(audio_mix(), "motor_idle")
+       && !voice_playing(audio_mix(), "motor_engine"),
+       "four seconds standing still with nothing pressed cuts the motor");
+    ck(voice_playing(audio_mix(), "motor_off"),
+       "and motor_off plays on that edge -- 1.66 s, shipped, never used before");
+
+    /* The grid reset is the other way in, and it must NOT play the transition:
+       0x00509ff0 zeroes the block, it does not switch an engine off. */
+    fake_car(7.0f, 1.f, 4, 0);
+    sfx_update(&CAR, eye, 0.f, 1.f / 60.f);
+    ck(voice_playing(audio_mix(), "motor_engine"), "(driving again restarts it)");
+    mix_stop_all(audio_mix());
+    sfx_engine_off();
+    fake_car(0.f, 0.f, 4, 0);
+    sfx_update(&CAR, eye, 0.f, 1.f / 60.f);
+    ck(!voice_playing(audio_mix(), "motor_engine")
+       && !voice_playing(audio_mix(), "motor_idle"),
+       "sfx_engine_off silences the motor at once -- this is the countdown");
+    ck(!voice_playing(audio_mix(), "motor_off"),
+       "and a grid reset is not an engine being switched off");
+
+    /* Leave the fixture driving, which is what C2 onward expects. */
+    fake_car(7.0f, 1.f, 4, 0);
+    sfx_update(&CAR, eye, 0.f, 1.f / 60.f);
+
     printf("\n-- C2 the surface loop --\n");
+    /* SETTLE BEFORE MEASURING, and this is not padding. loudness() is the rms of
+       one block from wherever each voice happens to be, and a loop that has just
+       been started is at sample 0 -- motor_engine's first block is quieter than
+       its steady state, which is enough to make "airborne is quieter" compare a
+       fresh engine against a running one and come out backwards. It did: 7419
+       against 7071 with the surface loop correctly stopped. Both measurements
+       are taken in steady state now. */
     fake_car(5.f, 1.f, 4, 0);
-    sfx_update(&CAR, eye, 0.f, 1.f / 60.f);
-    sfx_update(&CAR, eye, 0.f, 1.f / 60.f);
+    for (i = 0; i < 20; i++) {
+        sfx_update(&CAR, eye, 0.f, 1.f / 60.f);
+        (void)loudness(BLK);
+    }
     ground_loud = loudness(BLK);
     ck(sfx_current_surface() == SURF_WOOD,
        "the material comes from the GRID, not the track default "
@@ -691,8 +752,10 @@ static void part_c(void)
        "and it plays that material's loop");
 
     fake_car(5.f, 1.f, 0, 0);
-    sfx_update(&CAR, eye, 0.f, 1.f / 60.f);
-    sfx_update(&CAR, eye, 0.f, 1.f / 60.f);
+    for (i = 0; i < 20; i++) {
+        sfx_update(&CAR, eye, 0.f, 1.f / 60.f);
+        (void)loudness(BLK);
+    }
     air_loud = loudness(BLK);
     ck(!voice_playing(audio_mix(), "car_surf_wood"),
        "airborne STOPS the surface loop -- there are no tyres on anything");

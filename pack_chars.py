@@ -320,8 +320,90 @@ def variant_sets(model):
     return used, sets
 
 
+def drop_collision_boxes(m):
+    """Remove the road cars' authored COLLISION BOXES from what gets drawn.
+
+    Reported four times as "the npc cars are white boxes" and once as black
+    ones, and it is the geometry, not the draw path: each of the four road-car
+    models carries FIVE box meshes that the retail engine does not render, and
+    the port rendered all five on top of the vehicle.
+
+    What they are, measured (posed, against the mesh each one sits beside):
+
+      Hammer  Box00        5.27 x 1.42 x 2.37   body hammer_01_body 5.02 x 1.50 x 2.37
+              Box01..04_body 0.97 cubes         one on each wheel obj17*, same centre
+      Truck   cube1        4.49 x 1.03 x 1.90   body polySurface4_body 4.35 x 1.04 x 2.00
+              cube2..5_body 0.59 x 0.59 x 0.22  one on each wheel obj28..31, same centre
+      Trailer cube1        5.50 x 1.77 x 2.04   the whole tractor plus camper
+              cube2..5_body                     one on each wheel obj24..27, same centre
+      Btr     cube1_body   2.87 x 2.04 x 6.89   body Line38_body 3.00 x 1.58 x 6.68
+              cube2*       4 boxes              one per PAIR of the eight road wheels
+
+    THE DATA SAYS SO TWICE, so neither half is guessed:
+
+      - every one of them is 8 vertices and 12 triangles with a UV set of ONE
+        DISTINCT COORDINATE for the whole mesh -- (0,0) on the Truck and the
+        Trailer's cube1, (0, 0.998) on the Hammer, (0,1) on the Trailer's wheel
+        boxes. A mesh with one UV has no mapping; drawn, every face samples a
+        single texel, which is exactly the flat white and flat black boxes that
+        were reported. hummer_txt's is (0,0,0), so the Hammer was five black
+        boxes; the Truck's five have no texture at all and inherited slot 0,
+        treiler_fara, whose (0,0) is (176,201,211) -- the white ones;
+      - the Truck's five and the Trailer's cube1 carry texture id 0xFFFFFFFF
+        outright, the same "no texture" the .vsc packer already refuses to draw
+        (BATCH_NO_TEXTURE). build_model used to send those faces to slot 0.
+
+    ACROSS THE WHOLE CAST the predicate names 20 meshes and every one of them is
+    one of these: 5 in each of the four road-car models, 0 in the nine people
+    and animals, 0 in RoadCar. No drawn mesh anywhere has a one-point UV set --
+    which is what makes this a rule and not a name list. Asserted below, so a
+    repack that finds a sixth box or one in a person fails instead of shipping.
+
+    Called before variant_sets and posed_verts so the slot table and bmin/bmax
+    are measured on the same geometry that is drawn. The Hammer's box was the
+    first mesh naming hummer_txt, so its slot ORDER changes with this; the sets
+    are regenerated in the same pass and there is one of them.
+
+    NOT applied to RoadCar: it is a single mesh with no box in it, so the 0.70 m
+    ROADCAR path centre roadcar_centre_y() measures is untouched.
+
+    These five boxes are also the only per-vehicle collision volumes the data
+    carries, and RDCR's provider reads up to eight -- see dynamic-layer.md,
+    "the road cars' collision proxy", which still derives its spheres from the
+    model box rather than from these.
+    """
+    keep, boxes = [], []
+    for mesh in m["meshes"]:
+        one_uv = len(set(mesh["uvs"])) <= 1
+        is_box = len(mesh["verts"]) == 8 and len(mesh["faces"]) == 12
+        if one_uv and is_box:
+            boxes.append(mesh["name"])
+        else:
+            if one_uv:
+                raise SystemExit("%s/%s: one UV for the whole mesh but %d verts "
+                                 "/ %d tris -- not a box, and drawing it would "
+                                 "sample one texel" % (m["name"], mesh["name"],
+                                                       len(mesh["verts"]),
+                                                       len(mesh["faces"])))
+            keep.append(mesh)
+    if boxes and len(boxes) != 5:
+        raise SystemExit("%s: %d collision boxes, expected 5 (one body, four "
+                         "wheel groups): %s" % (m["name"], len(boxes), boxes))
+    if boxes and m["name"] not in ("Hammer", "Truck", "Trailer", "Btr"):
+        raise SystemExit("%s: a collision box in a model that is not a road "
+                         "car: %s" % (m["name"], boxes))
+    m["meshes"] = keep
+    return boxes
+
+
 def build_model(name, csi, texroot, alpha):
     m = sbchar.read_model(name)
+    boxes = drop_collision_boxes(m)
+    if boxes:
+        # Printed because it is the one thing about a road car this
+        # removes, and a build log with the line missing is the drop gone.
+        print("   %s: %d collision boxes not drawn (%s)"
+              % (name, len(boxes), ", ".join(boxes)))
     slots, sets = variant_sets(m)
     slot_of = {t: i for i, t in enumerate(slots)}
 

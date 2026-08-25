@@ -1074,7 +1074,7 @@ once the car is spinning faster than 180°/s.
 | `defDistY` | 30 | **0.3636 m** above |
 | `accDistY` | 1 | 0.1 /s vertical pull-back |
 | `accAlpha` | 50 | 0.4949 -> 98.99 °/s yaw pull-back |
-| `VisTurn` | 70 | **11.82°** of look-into-turn |
+| `VisTurn` | 70 | **11.82°** of aim pitched UP, NOT a look-into-turn — see `docs/physics.md` |
 
 A camera 0.79 m behind and 0.36 m above is another independent confirmation of
 the scale story: these are 1:10 models — a 0.5 m car on 0.072 m wheels doing
@@ -1094,13 +1094,16 @@ about full-size cars.
 So flat out on the throttle the camera sits at `1.7 x defDistXZ` = 1.348 m. The
 test harness reproduces that figure exactly.
 
-#### Divergence
+#### Divergence — WITHDRAWN
 
-The original expresses the car in the camera's **previous** frame and rebuilds
-incrementally; the second half of that (the matrix assembly inside `camFollow`)
-is not transcribed. `cam.c` works in the car's frame instead, which is equivalent
-while the camera trails the car — the case that matters — and is much easier to
-read. The follower shape and every constant are the originals.
+This section used to claim the original expressed the car in the camera's
+**previous** frame and that the second half of `camFollow` was not transcribed.
+Both are wrong. `camFollow` builds the eye from the **current** reference frame
+every frame, exactly as `cam.c` does — the previous frame it stores at `cam+0x2b`
+is written and never read back. And the second half is not inside `camFollow` at
+all: it is `camPost 0x501180`, registered as the camera's per-frame hook by
+`0x500760`, and it holds the obstacle lift, the ground clamp and the VisTurn aim
+pitch. All three are now in `cam.c`. See `docs/physics.md`, "The follow camera".
 
 ### Diagnosing three reported symptoms — the geometry was invented
 

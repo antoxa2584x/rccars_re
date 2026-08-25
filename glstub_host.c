@@ -29,6 +29,14 @@ void glTranslatef(float x, float y, float z) { }
 void glPopMatrix(void) { }
 void glPushMatrix(void) { }
 void glTexCoordPointer(GLint size, GLenum type, GLsizei stride, const void *p) { }
+/* The car's per-vertex light -- scene.c binds it as a colour array and uploads
+   it per frame (carlight.h). No-op here: nothing in this harness asserts on a
+   draw. */
+void glColorPointer(GLint size, GLenum type, GLsizei stride, const void *p)
+{ (void)size; (void)type; (void)stride; (void)p; }
+void glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size,
+                     const void *data)
+{ (void)target; (void)offset; (void)size; (void)data; }
 void glTexEnvi(GLenum target, GLenum pname, GLint param) { }
 void glTexImage2D(GLenum t, GLint lvl, GLint ifmt, GLsizei w, GLsizei h,
                   GLint border, GLenum fmt, GLenum type, const void *px) { }
