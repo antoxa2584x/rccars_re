@@ -72,7 +72,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import sb2obj as S
 
-DB = "/mnt/c/Games/RC Cars/RCCarsDB"
+DB = os.environ.get("RCCARS_DB", "/mnt/c/Games/RC Cars/RCCarsDB")
 
 # Which database each model lives in. RoadCar is listed for completeness; no
 # track instances it, and its two textures are not in the .csi tree either.

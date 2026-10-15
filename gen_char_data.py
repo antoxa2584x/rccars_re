@@ -69,10 +69,10 @@ import sb2obj as S
 import sbchar
 from dump_physics import read_crs
 
-EXE = "/mnt/c/Games/RC Cars/RCCars.exe"
-DB = "/mnt/c/Games/RC Cars/RCCarsDB"
-SETTINGS = "/mnt/c/tools/rccars_extracted/Settings"
-PROFILES = "/mnt/c/tools/rccars_extracted/Profiles"
+EXE = os.environ.get("RCCARS_EXE", "/mnt/c/Games/RC Cars/RCCars.exe")
+DB = os.environ.get("RCCARS_DB", "/mnt/c/Games/RC Cars/RCCarsDB")
+SETTINGS = os.environ.get("RCCARS_SETTINGS", "/mnt/c/tools/rccars_extracted/Settings")
+PROFILES = os.environ.get("RCCARS_PROFILES", "/mnt/c/tools/rccars_extracted/Profiles")
 
 TRACKS = ["beach_1", "beach_2", "beach_3", "beach_4", "country_1", "country_2",
           "country_3", "country_4", "urban_1", "urban_2"]
